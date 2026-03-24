@@ -1,0 +1,1090 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>BTC Power Law Monitor</title>
+  <!-- React 18 -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <!-- Babel Standalone (JSX transpiler) -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    * { -webkit-tap-highlight-color: transparent; box-sizing: border-box; }
+    body { margin: 0; padding: 0; background: #020617; overscroll-behavior: none; }
+    input[type="number"]::-webkit-inner-spin-button,
+    input[type="number"]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useMemo, useEffect, useCallback } = React;
+
+// BTC Power Law Monitor v4.0 — live price feed + auto-refresh
+
+// ============================================================================
+// BTC POWER LAW MONITOR v2
+// Skaleninvariante Quantil-Regression mit Exponent-Decay + Log-Periodische Oszillation
+// ============================================================================
+
+// Genesis: April 6, 2009
+const GENESIS = new Date("2009-04-06").getTime();
+const MS_PER_DAY = 86400000;
+
+// ---------------------------------------------------------------------------
+// MODEL PARAMETERS — calibrated to scale-invariant quantile regression (w=1/t)
+//
+// Decay model: ln(P) = a + (β − d·ln(t))·ln(t)   where t = days since genesis
+//
+// Research findings:
+//   - 8 independent decay functions converge on d ≈ 0.029 at the median
+//   - Floor (Q1) has d ≈ 0 (no decay) — support accelerates
+//   - Ceiling has d > 0.029 — upper bound decays faster
+//   - Constant exponent (d=0) rejected at median: Simpson's Paradox
+//
+// Calibration targets (derived from research table):
+//   Median:  today ~$101k,  5yr ~$375k,  10yr ~$1.07M
+//   Floor:   today ~$56k,   5yr ~$209k,  10yr ~$594k   (~45% below median)
+//   Ceiling: today ~$160k,  5yr ~$597k,  10yr ~$1.69M  (~60% above median)
+// ---------------------------------------------------------------------------
+
+const MODELS = {
+  floor:   { beta: 5.10,  d: 0.000, targetToday: 56000,   label: "Floor (Q1)",        color: "#22c55e", desc: "Kein Decay, niedrigerer β" },
+  median:  { beta: 5.60,  d: 0.029, targetToday: 101000,  label: "Median Fair Value",  color: "#f59e0b", desc: "Decay d=0.029" },
+  ceiling: { beta: 5.90,  d: 0.045, targetToday: 160000,  label: "Obere Begrenzung",   color: "#ef4444", desc: "Stärkerer Decay d=0.045" },
+};
+
+// ---------------------------------------------------------------------------
+// LOG-PERIODIC OSCILLATION (Discrete Scale Invariance)
+//
+// After removing the power law trend, the residual follows:
+//   r(t) = Σ Cₙ · cos(n·ω·ln(t) + φₙ)    (harmonics n = 1,2,3,4)
+//
+// λ ≈ 2.0 → ω = 2π/ln(λ) ≈ 9.06
+// Phase calibrated so fundamental peaks near Oct 2025 ATH ($126k)
+// R² ≈ 0.445 — explains ~45% of variance in residuals
+//
+// ⚠️  These parameters are approximate. The amplitudes and phases are
+//     estimated to reproduce known cycle peaks qualitatively.
+//     For production use, fit against actual daily price data.
+// ---------------------------------------------------------------------------
+
+const OSCILLATION = {
+  // ---------------------------------------------------------------------------
+  // FULL PRODUCTION FIT WITH AMPLITUDE DECAY
+  // 5,704 daily points (2010-07 to 2026-03)
+  // osc(t) = Σ Cₙ · t^(-δ) · cos(n·ω·ln(t) + φₙ)
+  //
+  // ω = 8.894 fixed from DSI research. δ = 0.684 found via grid search.
+  // Amplitudes + phases fitted via weighted LS (w=1/t) on Decay-PL residuals.
+  // ---------------------------------------------------------------------------
+  omega: 8.894,
+  lambda: 2.027,
+  ampDecay: 0.68357,  // δ: amplitude damping, Cₙ·t^(-δ)
+  harmonics: [
+    { n: 1, C: 118.05080, phi: 3.06676 },  // fundamental
+    { n: 2, C: 45.27629, phi: 0.04083 },   // 2ω
+    { n: 3, C: 17.11566, phi: 3.10856 },   // 3ω
+    { n: 4, C: 8.55485, phi: -0.57302 },   // 4ω
+  ],
+  rSquared: 0.605,
+  // ---------------------------------------------------------------------------
+  // AMPLITUDE DECAY INSIGHT:
+  //   R² improves 0.487 → 0.605 (+12pp). δ=0.684 means each harmonic's
+  //   effective amplitude shrinks as t^(-0.68). Concrete effect on fundamental:
+  //     2011: B_eff=0.62 dex | 2017: 0.22 | 2021: 0.17 | 2025: 0.14 | 2028: 0.12
+  //   This resolves the out-of-sample amplitude overshoot documented in the
+  //   DSI research (R²_oos = −3.50 without decay).
+  //
+  //   PRACTICAL IMPACT: Peak projection 2027-28 drops from ~$537k to ~$265k.
+  //   The timing structure (ω, phases) is unchanged — only the magnitude
+  //   of the oscillation is damped, matching the empirical observation that
+  //   each successive cycle produces smaller proportional moves.
+  //
+  // Validation: 4/6 peaks ✓, 3/4 troughs ✓ (same as before — timing unchanged)
+  // Divergence today: 49pp (down from 76pp without amp decay)
+  // ---------------------------------------------------------------------------
+};
+
+// ---------------------------------------------------------------------------
+// HELPER FUNCTIONS
+// ---------------------------------------------------------------------------
+
+function daysSinceGenesis(date = new Date()) {
+  return (date.getTime() - GENESIS) / MS_PER_DAY;
+}
+
+function powerLawPrice(t, model) {
+  const lnT = Math.log(t);
+  return Math.exp(model.a + (model.beta - model.d * lnT) * lnT);
+}
+
+function oscillationValue(t) {
+  const lnT = Math.log(t);
+  const damping = Math.pow(t, -OSCILLATION.ampDecay);  // t^(-δ): amplitude shrinks over time
+  let val = 0;
+  for (const h of OSCILLATION.harmonics) {
+    val += h.C * damping * Math.cos(h.n * OSCILLATION.omega * lnT + h.phi);
+  }
+  return val; // in ln(price) space — multiply power law by exp(val)
+}
+
+function powerLawWithOscillation(t, model) {
+  return powerLawPrice(t, model) * Math.exp(oscillationValue(t));
+}
+
+// Calibrate 'a' for each model so it hits targetToday at current date
+(function calibrateModels() {
+  const tToday = daysSinceGenesis(new Date("2026-03-23"));
+  const lnT = Math.log(tToday);
+  for (const model of Object.values(MODELS)) {
+    model.a = Math.log(model.targetToday) - (model.beta - model.d * lnT) * lnT;
+  }
+})();
+
+// ---------------------------------------------------------------------------
+// ZONE CLASSIFICATION
+// ---------------------------------------------------------------------------
+
+function getZone(price, fairValue) {
+  const ratio = price / fairValue;
+  if (ratio < 0.55) return { zone: "DEEP_VALUE",  label: "Deep Value",              color: "#16a34a", bg: "#052e16", action: "DCA verdreifachen + Cash-Reserve deployen" };
+  if (ratio < 0.75) return { zone: "ACCUMULATE",  label: "Akkumulation",            color: "#22c55e", bg: "#14532d", action: "DCA verdoppeln" };
+  if (ratio < 0.95) return { zone: "UNDERVALUED", label: "Unterbewertet",           color: "#86efac", bg: "#1a3a2a", action: "Normales DCA + leichte Aufstockung" };
+  if (ratio < 1.15) return { zone: "FAIR",        label: "Fair Value Zone",         color: "#fbbf24", bg: "#422006", action: "Normales DCA beibehalten" };
+  if (ratio < 1.50) return { zone: "OVERVALUED",  label: "Leicht überbewertet",     color: "#f97316", bg: "#431407", action: "DCA auf 50% reduzieren" };
+  if (ratio < 2.00) return { zone: "ELEVATED",    label: "Signifikant überbewertet",color: "#ef4444", bg: "#450a0a", action: "15% Position trimmen" };
+  if (ratio < 3.00) return { zone: "EUPHORIA",    label: "Zyklusreife",             color: "#dc2626", bg: "#450a0a", action: "Weitere 15-20% trimmen" };
+  return                    { zone: "EXTREME",     label: "Euphorie-Extreme",        color: "#991b1b", bg: "#450a0a", action: "Aggressive Reduktion auf 30%" };
+}
+
+// ---------------------------------------------------------------------------
+// TAKE PROFIT LEVELS
+// ---------------------------------------------------------------------------
+
+function getTakeProfitLevels(fairValue) {
+  return [
+    { level: "Fair Value",              price: fairValue,       action: "DCA normal fortsetzen",   pct: "0%" },
+    { level: "Moderate Überbew.",       price: fairValue * 1.5, action: "DCA auf 50% reduzieren",  pct: "+50%" },
+    { level: "Signifikante Überbew.",   price: fairValue * 2.0, action: "15% trimmen",             pct: "+100%" },
+    { level: "Zyklusreife",            price: fairValue * 3.0, action: "Weitere 15-20% trimmen",  pct: "+200%" },
+    { level: "Euphorie",              price: fairValue * 4.5, action: "Aggressive Reduktion",     pct: "+350%" },
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// HISTORICAL BTC PRICES (quarterly milestones for chart overlay)
+// ---------------------------------------------------------------------------
+
+const HISTORICAL_PRICES = [
+  // [year_fraction, price_usd]
+  [2013.0, 13], [2013.25, 90], [2013.5, 100], [2013.75, 200], [2013.85, 1150], [2013.95, 750],
+  [2014.0, 800], [2014.25, 450], [2014.5, 580], [2014.75, 380], [2014.95, 320],
+  [2015.0, 290], [2015.25, 240], [2015.5, 260], [2015.75, 230], [2015.95, 430],
+  [2016.0, 430], [2016.25, 420], [2016.5, 660], [2016.75, 610], [2016.95, 960],
+  [2017.0, 1000], [2017.25, 1080], [2017.4, 2500], [2017.5, 2600], [2017.6, 4400], [2017.75, 5600], [2017.85, 11000], [2017.95, 14000],
+  [2018.0, 13800], [2018.1, 8500], [2018.25, 7000], [2018.5, 6400], [2018.75, 6500], [2018.9, 4000], [2018.95, 3700],
+  [2019.0, 3700], [2019.25, 4100], [2019.4, 8000], [2019.5, 11500], [2019.6, 10000], [2019.75, 8300], [2019.95, 7200],
+  [2020.0, 7200], [2020.15, 8700], [2020.2, 5200], [2020.25, 6400], [2020.5, 9200], [2020.75, 10800], [2020.85, 13800], [2020.95, 29000],
+  [2021.0, 33000], [2021.1, 46000], [2021.2, 58000], [2021.25, 35000], [2021.35, 35000], [2021.5, 42000], [2021.65, 48000], [2021.75, 62000], [2021.85, 69000], [2021.9, 57000], [2021.95, 47000],
+  [2022.0, 38000], [2022.15, 42000], [2022.25, 31000], [2022.4, 29000], [2022.5, 20000], [2022.65, 23000], [2022.75, 20000], [2022.85, 20500], [2022.9, 17000], [2022.95, 16500],
+  [2023.0, 16700], [2023.1, 21000], [2023.2, 23000], [2023.25, 28000], [2023.35, 29000], [2023.5, 30000], [2023.65, 26000], [2023.75, 27000], [2023.85, 34000], [2023.95, 42000],
+  [2024.0, 44000], [2024.1, 52000], [2024.2, 71000], [2024.25, 64000], [2024.35, 66000], [2024.5, 58000], [2024.6, 65000], [2024.7, 56000], [2024.75, 63000], [2024.85, 73000], [2024.95, 94000],
+  [2025.0, 96000], [2025.15, 102000], [2025.25, 85000], [2025.35, 82000], [2025.5, 95000], [2025.6, 105000], [2025.75, 126000], [2025.85, 100000], [2025.95, 94000],
+  [2026.0, 93000], [2026.05, 73000], [2026.1, 72000], [2026.15, 70000], [2026.22, 68500],
+];
+
+// ---------------------------------------------------------------------------
+// FORMATTING
+// ---------------------------------------------------------------------------
+
+const fmt = (n) => {
+  if (n >= 1e6) return `$${(n / 1e6).toFixed(2)}M`;
+  if (n >= 1e3) return `$${(n / 1e3).toFixed(0)}k`;
+  return `$${n.toFixed(0)}`;
+};
+
+const fmtPrecise = (n) => {
+  if (n >= 1e6) return `$${(n / 1e6).toFixed(3)}M`;
+  if (n >= 1e3) return `$${(n / 1e3).toFixed(1)}k`;
+  return `$${n.toFixed(0)}`;
+};
+
+// ---------------------------------------------------------------------------
+// CHART: Power Law Bands + Historical Prices + Oscillation
+// ---------------------------------------------------------------------------
+
+function PowerLawChart({ currentPrice, currentDate, showOscillation }) {
+  const tNow = daysSinceGenesis(currentDate);
+  const startYear = 2013;
+  const endYear = 2036;
+  const POINTS = 500;
+
+  const currentYear = currentDate.getFullYear() + (currentDate.getMonth() + currentDate.getDate() / 30) / 12;
+
+  const curves = useMemo(() => {
+    const result = { floor: [], median: [], ceiling: [], oscMedian: [], oscFloor: [], oscCeiling: [] };
+    for (let i = 0; i <= POINTS; i++) {
+      const frac = i / POINTS;
+      const year = startYear + (endYear - startYear) * frac;
+      const date = new Date(new Date(startYear, 0, 1).getTime() + (year - startYear) * 365.25 * MS_PER_DAY);
+      const t = daysSinceGenesis(date);
+      if (t > 100) {
+        const pt = { year, t };
+        const oscVal = oscillationValue(t);
+        const oscMul = Math.exp(oscVal);
+        result.floor.push({ ...pt, price: powerLawPrice(t, MODELS.floor) });
+        result.median.push({ ...pt, price: powerLawPrice(t, MODELS.median) });
+        result.ceiling.push({ ...pt, price: powerLawPrice(t, MODELS.ceiling) });
+        result.oscMedian.push({ ...pt, price: powerLawPrice(t, MODELS.median) * oscMul });
+        result.oscFloor.push({ ...pt, price: powerLawPrice(t, MODELS.floor) * oscMul });
+        result.oscCeiling.push({ ...pt, price: powerLawPrice(t, MODELS.ceiling) * oscMul });
+      }
+    }
+    return result;
+  }, []);
+
+  const W = 720, H = 380, PAD = { top: 20, right: 55, bottom: 35, left: 62 };
+  const plotW = W - PAD.left - PAD.right;
+  const plotH = H - PAD.top - PAD.bottom;
+
+  const minPrice = 10;
+  const maxPrice = 10000000;
+  const logMin = Math.log10(minPrice);
+  const logMax = Math.log10(maxPrice);
+
+  const xScale = (year) => PAD.left + ((year - startYear) / (endYear - startYear)) * plotW;
+  const yScale = (price) => {
+    const logP = Math.log10(Math.max(price, minPrice));
+    return PAD.top + plotH - ((logP - logMin) / (logMax - logMin)) * plotH;
+  };
+
+  const curvePath = (data) => data
+    .filter(d => d.price > 0 && isFinite(d.price))
+    .map((d, i) => `${i === 0 ? 'M' : 'L'}${xScale(d.year).toFixed(1)},${yScale(d.price).toFixed(1)}`)
+    .join(' ');
+
+  // Only future portion of a curve (from currentYear onward)
+  const futureOnly = (data) => data.filter(d => d.year >= currentYear && d.price > 0 && isFinite(d.price));
+
+  const cx = xScale(currentYear);
+  const cy = yScale(currentPrice);
+
+  const gridYears = [2014, 2016, 2018, 2020, 2022, 2024, 2026, 2028, 2030, 2032, 2034];
+  const gridPrices = [100, 1000, 10000, 100000, 1000000];
+
+  const zone = getZone(currentPrice, powerLawPrice(tNow, MODELS.median));
+
+  // Band fill (floor to ceiling)
+  const floorPts = curves.floor.filter(d => d.price > 0);
+  const ceilPts = curves.ceiling.filter(d => d.price > 0);
+  const bandPath = floorPts.map((d, i) => `${i === 0 ? 'M' : 'L'}${xScale(d.year).toFixed(1)},${yScale(d.price).toFixed(1)}`).join(' ')
+    + [...ceilPts].reverse().map(d => `L${xScale(d.year).toFixed(1)},${yScale(d.price).toFixed(1)}`).join('') + 'Z';
+
+  // Forecast band (osc-adjusted floor to osc-adjusted ceiling, future only)
+  const futFloor = futureOnly(curves.oscFloor);
+  const futCeil = futureOnly(curves.oscCeiling);
+  let forecastBandPath = '';
+  if (showOscillation && futFloor.length > 1 && futCeil.length > 1) {
+    forecastBandPath = futFloor.map((d, i) => `${i === 0 ? 'M' : 'L'}${xScale(d.year).toFixed(1)},${yScale(d.price).toFixed(1)}`).join(' ')
+      + [...futCeil].reverse().map(d => `L${xScale(d.year).toFixed(1)},${yScale(d.price).toFixed(1)}`).join('') + 'Z';
+  }
+
+  // Historical prices path
+  const histPath = HISTORICAL_PRICES
+    .filter(([y]) => y >= startYear && y <= endYear)
+    .map(([y, p], i) => `${i === 0 ? 'M' : 'L'}${xScale(y).toFixed(1)},${yScale(p).toFixed(1)}`)
+    .join(' ');
+
+  // Band labels at right edge (at endYear)
+  const tEnd = daysSinceGenesis(new Date(endYear, 0, 1));
+  const labelData = [
+    { price: powerLawPrice(tEnd, MODELS.ceiling), color: "#ef4444", label: "Ceiling" },
+    { price: powerLawPrice(tEnd, MODELS.median), color: "#f59e0b", label: "Median" },
+    { price: powerLawPrice(tEnd, MODELS.floor), color: "#22c55e", label: "Floor" },
+  ];
+
+  // Band labels at current date (right side of "now" line)
+  const nowLabels = [
+    { price: powerLawPrice(tNow, MODELS.ceiling), color: "#ef4444" },
+    { price: powerLawPrice(tNow, MODELS.median), color: "#f59e0b" },
+    { price: powerLawPrice(tNow, MODELS.floor), color: "#22c55e" },
+  ];
+
+  // Short format for labels
+  const fmtShort = (n) => {
+    if (n >= 1e6) return `${(n/1e6).toFixed(1)}M`;
+    if (n >= 1e3) return `${(n/1e3).toFixed(0)}k`;
+    return `${n.toFixed(0)}`;
+  };
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxWidth: 720 }}>
+      <rect width={W} height={H} fill="#0f172a" rx="8" />
+
+      {/* Grid */}
+      {gridYears.map(y => (
+        <g key={y}>
+          <line x1={xScale(y)} y1={PAD.top} x2={xScale(y)} y2={PAD.top + plotH} stroke="#1e293b" strokeWidth="0.5" />
+          <text x={xScale(y)} y={H - 8} fill="#64748b" fontSize="9" textAnchor="middle">{y}</text>
+        </g>
+      ))}
+      {gridPrices.map(p => (
+        <g key={p}>
+          <line x1={PAD.left} y1={yScale(p)} x2={PAD.left + plotW} y2={yScale(p)} stroke="#1e293b" strokeWidth="0.5" />
+          <text x={PAD.left - 5} y={yScale(p) + 3} fill="#64748b" fontSize="8" textAnchor="end">
+            {p >= 1e6 ? `$${p/1e6}M` : p >= 1e3 ? `$${p/1e3}k` : `$${p}`}
+          </text>
+        </g>
+      ))}
+
+      {/* Band fill (floor–ceiling) */}
+      <path d={bandPath} fill="#1e3a2a" opacity="0.2" />
+
+      {/* Forecast band (osc-adjusted floor–ceiling, future only) */}
+      {showOscillation && forecastBandPath && (
+        <path d={forecastBandPath} fill="#7c3aed" opacity="0.25" />
+      )}
+
+      {/* Model curves */}
+      <path d={curvePath(curves.floor)} fill="none" stroke="#22c55e" strokeWidth="1.2" opacity="0.5" strokeDasharray="4,3" />
+      <path d={curvePath(curves.median)} fill="none" stroke="#f59e0b" strokeWidth="2" />
+      <path d={curvePath(curves.ceiling)} fill="none" stroke="#ef4444" strokeWidth="1.2" opacity="0.5" strokeDasharray="4,3" />
+
+      {/* Log-periodic oscillation on median */}
+      {showOscillation && (
+        <path d={curvePath(curves.oscMedian)} fill="none" stroke="#c084fc" strokeWidth="1.5" opacity="0.8" />
+      )}
+
+      {/* Osc-adjusted floor and ceiling (future only, dashed) */}
+      {showOscillation && (
+        <>
+          <path d={curvePath(futureOnly(curves.oscFloor))} fill="none" stroke="#a78bfa" strokeWidth="1.2" opacity="0.6" strokeDasharray="3,4" />
+          <path d={curvePath(futureOnly(curves.oscCeiling))} fill="none" stroke="#a78bfa" strokeWidth="1.2" opacity="0.6" strokeDasharray="3,4" />
+        </>
+      )}
+
+      {/* Historical BTC price */}
+      <path d={histPath} fill="none" stroke="#94a3b8" strokeWidth="1.2" opacity="0.7" />
+
+      {/* "Now" divider */}
+      <line x1={cx} y1={PAD.top} x2={cx} y2={PAD.top + plotH} stroke="#f59e0b" strokeWidth="1" strokeDasharray="4,4" opacity="0.5" />
+      <rect x={cx - 18} y={PAD.top - 1} width="36" height="12" fill="#422006" rx="3" />
+      <text x={cx} y={PAD.top + 8} fill="#f59e0b" fontSize="7" textAnchor="middle" fontWeight="bold">HEUTE</text>
+
+      {/* Current position marker */}
+      <circle cx={cx} cy={cy} r="5" fill={zone.color} stroke="#fff" strokeWidth="1.5" />
+      <text x={cx - 8} y={cy - 10} fill={zone.color} fontSize="9" fontWeight="bold" textAnchor="end">
+        ${(currentPrice / 1000).toFixed(0)}k
+      </text>
+
+      {/* Future cycle markers (peak/trough) */}
+      {showOscillation && (() => {
+        const markers = [];
+        const futCurve = curves.oscMedian.filter(d => d.year > currentYear);
+        for (let i = 1; i < futCurve.length - 1; i++) {
+          const prev = futCurve[i-1], curr = futCurve[i], next = futCurve[i+1];
+          const oscPrev = oscillationValue(prev.t);
+          const oscCurr = oscillationValue(curr.t);
+          const oscNext = oscillationValue(next.t);
+          // Peak: oscillation local max, positive
+          if (oscCurr > oscPrev && oscCurr > oscNext && oscCurr > 0.05) {
+            if (!markers.length || curr.year - markers[markers.length-1].year > 1.5) {
+              markers.push({ year: curr.year, price: curr.price, type: 'peak' });
+            }
+          }
+          // Trough: oscillation local min, negative
+          if (oscCurr < oscPrev && oscCurr < oscNext && oscCurr < -0.02) {
+            if (!markers.length || curr.year - markers[markers.length-1].year > 1.5) {
+              markers.push({ year: curr.year, price: curr.price, type: 'trough' });
+            }
+          }
+        }
+        return markers.map((m, i) => {
+          const x = xScale(m.year);
+          const y = yScale(m.price);
+          const isPeak = m.type === 'peak';
+          const color = isPeak ? '#22c55e' : '#ef4444';
+          const label = isPeak ? 'Peak' : 'Trough';
+          const yr = Math.floor(m.year);
+          const mo = Math.floor((m.year % 1) * 12) + 1;
+          const priceLabel = m.price >= 1e6 ? `$${(m.price/1e6).toFixed(1)}M` : `$${(m.price/1e3).toFixed(0)}k`;
+          const labelY = isPeak ? y - 24 : y + 6;
+          return (
+            <g key={`cyc-${i}`}>
+              <line x1={x} y1={PAD.top} x2={x} y2={PAD.top + plotH}
+                stroke={color} strokeWidth="1" strokeDasharray="4,4" opacity="0.4" />
+              <circle cx={x} cy={y} r="4" fill={color} opacity="0.7" />
+              <rect x={x - 26} y={labelY} width="52" height="22" fill="#0f172a" opacity="0.85" rx="3" />
+              <text x={x} y={labelY + 10} fill={color} fontSize="7.5" textAnchor="middle" fontWeight="bold">
+                {label} ~{mo}/{yr}
+              </text>
+              <text x={x} y={labelY + 19} fill={color} fontSize="7" textAnchor="middle" opacity="0.8">
+                ~{priceLabel}
+              </text>
+            </g>
+          );
+        });
+      })()}
+
+      {/* Band labels at right edge */}
+      {labelData.map((d, i) => {
+        const y = yScale(d.price);
+        return (
+          <g key={i}>
+            <line x1={PAD.left + plotW} y1={y} x2={PAD.left + plotW + 3} y2={y} stroke={d.color} strokeWidth="1" opacity="0.5" />
+            <text x={W - PAD.right + 6} y={y + 3} fill={d.color} fontSize="7.5" fontWeight="bold">
+              ${fmtShort(d.price)}
+            </text>
+          </g>
+        );
+      })}
+
+      {/* Legend */}
+      <g transform={`translate(${PAD.left + 5}, ${PAD.top + 10})`}>
+        <line x1="0" y1="0" x2="14" y2="0" stroke="#94a3b8" strokeWidth="1.2" />
+        <text x="18" y="3" fill="#94a3b8" fontSize="8">BTC Preis (hist.)</text>
+        <line x1="0" y1="12" x2="14" y2="12" stroke="#f59e0b" strokeWidth="2" />
+        <text x="18" y="15" fill="#f59e0b" fontSize="8">Median (Decay)</text>
+        <line x1="0" y1="24" x2="14" y2="24" stroke="#22c55e" strokeWidth="1.2" strokeDasharray="4,3" />
+        <text x="18" y="27" fill="#22c55e" fontSize="8">Floor / Ceiling</text>
+        {showOscillation && <>
+          <line x1="0" y1="36" x2="14" y2="36" stroke="#c084fc" strokeWidth="1.5" />
+          <text x="18" y="39" fill="#c084fc" fontSize="8">Osc. Median (gedämpft)</text>
+          <rect x="0" y="45" width="14" height="8" fill="#7c3aed" opacity="0.3" rx="1" />
+          <text x="18" y="52" fill="#a78bfa" fontSize="8">Forecast-Band (Osc.)</text>
+        </>}
+      </g>
+    </svg>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// CHART: Oscillation Residual (Cycle Position)
+// ---------------------------------------------------------------------------
+
+function OscillationChart({ currentDate }) {
+  const tNow = daysSinceGenesis(currentDate);
+  const startYear = 2013;
+  const endYear = 2036;
+  const POINTS = 500;
+
+  const data = useMemo(() => {
+    const result = [];
+    for (let i = 0; i <= POINTS; i++) {
+      const frac = i / POINTS;
+      const year = startYear + (endYear - startYear) * frac;
+      const date = new Date(new Date(startYear, 0, 1).getTime() + (year - startYear) * 365.25 * MS_PER_DAY);
+      const t = daysSinceGenesis(date);
+      if (t > 100) {
+        result.push({ year, t, osc: oscillationValue(t) });
+      }
+    }
+    return result;
+  }, []);
+
+  // Historical residuals: actual price vs power law median
+  const histResiduals = useMemo(() => {
+    return HISTORICAL_PRICES
+      .filter(([y]) => y >= startYear && y <= endYear)
+      .map(([y, p]) => {
+        const date = new Date(new Date(startYear, 0, 1).getTime() + (y - startYear) * 365.25 * MS_PER_DAY);
+        const t = daysSinceGenesis(date);
+        if (t > 100) {
+          const fairVal = powerLawPrice(t, MODELS.median);
+          return { year: y, residual: Math.log(p / fairVal) };
+        }
+        return null;
+      })
+      .filter(Boolean);
+  }, []);
+
+  const W = 720, H = 200, PAD = { top: 15, right: 25, bottom: 30, left: 62 };
+  const plotW = W - PAD.left - PAD.right;
+  const plotH = H - PAD.top - PAD.bottom;
+
+  const yMin = -2.5, yMax = 2.5;
+  const xScale = (year) => PAD.left + ((year - startYear) / (endYear - startYear)) * plotW;
+  const yScale = (val) => PAD.top + plotH / 2 - (val / (yMax - yMin)) * plotH;
+
+  const oscPath = data.map((d, i) =>
+    `${i === 0 ? 'M' : 'L'}${xScale(d.year).toFixed(1)},${yScale(d.osc).toFixed(1)}`
+  ).join(' ');
+
+  // Fill areas above/below zero
+  const oscAbovePath = data.map((d, i) => {
+    const y = Math.min(d.osc, 0);
+    return `${i === 0 ? 'M' : 'L'}${xScale(d.year).toFixed(1)},${yScale(Math.max(d.osc, 0)).toFixed(1)}`;
+  }).join(' ') + ` L${xScale(data[data.length-1].year).toFixed(1)},${yScale(0).toFixed(1)} L${xScale(data[0].year).toFixed(1)},${yScale(0).toFixed(1)} Z`;
+
+  const currentYear = currentDate.getFullYear() + (currentDate.getMonth() + currentDate.getDate() / 30) / 12;
+  const currentOsc = oscillationValue(tNow);
+
+  const gridYears = [2014, 2016, 2018, 2020, 2022, 2024, 2026, 2028, 2030, 2032, 2034];
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxWidth: 720 }}>
+      <rect width={W} height={H} fill="#0f172a" rx="8" />
+
+      {/* Grid */}
+      {gridYears.map(y => (
+        <g key={y}>
+          <line x1={xScale(y)} y1={PAD.top} x2={xScale(y)} y2={PAD.top + plotH} stroke="#1e293b" strokeWidth="0.5" />
+          <text x={xScale(y)} y={H - 5} fill="#64748b" fontSize="9" textAnchor="middle">{y}</text>
+        </g>
+      ))}
+
+      {/* Zero line */}
+      <line x1={PAD.left} y1={yScale(0)} x2={PAD.left + plotW} y2={yScale(0)} stroke="#475569" strokeWidth="1" />
+
+      {/* Y-axis labels */}
+      {[-2.0, -1.5, -1.0, -0.5, 0, 0.5, 1.0, 1.5, 2.0].map(v => (
+        <text key={v} x={PAD.left - 5} y={yScale(v) + 3} fill="#64748b" fontSize="8" textAnchor="end">
+          {v > 0 ? `+${v}` : v}
+        </text>
+      ))}
+
+      {/* Zone fill */}
+      <rect x={PAD.left} y={yScale(2.5)} width={plotW} height={yScale(0) - yScale(2.5)} fill="#22c55e" opacity="0.06" />
+      <rect x={PAD.left} y={yScale(0)} width={plotW} height={yScale(-2.5) - yScale(0)} fill="#ef4444" opacity="0.06" />
+
+      {/* Zone labels */}
+      <text x={PAD.left + 4} y={yScale(2.0)} fill="#22c55e" fontSize="8" opacity="0.5">Überbewertung</text>
+      <text x={PAD.left + 4} y={yScale(-1.8)} fill="#ef4444" fontSize="8" opacity="0.5">Unterbewertung</text>
+
+      {/* Historical residuals as dots */}
+      {histResiduals.map((d, i) => (
+        <circle key={i} cx={xScale(d.year)} cy={yScale(d.residual)} r="2"
+          fill={d.residual > 0 ? "#86efac" : "#fca5a5"} opacity="0.6" />
+      ))}
+
+      {/* Oscillation model curve */}
+      <path d={oscPath} fill="none" stroke="#c084fc" strokeWidth="2" />
+
+      {/* Future peak/trough markers */}
+      {(() => {
+        const markers = [];
+        const futureData = data.filter(d => d.year > currentYear);
+        // Find all future peaks and troughs
+        for (let i = 1; i < futureData.length - 1; i++) {
+          const prev = futureData[i-1], curr = futureData[i], next = futureData[i+1];
+          if (curr.osc > prev.osc && curr.osc > next.osc && curr.osc > 0.05) {
+            // Check not too close to last marker
+            if (!markers.length || curr.year - markers[markers.length-1].year > 1.5) {
+              markers.push({ year: curr.year, osc: curr.osc, type: 'peak' });
+            }
+          }
+          if (curr.osc < prev.osc && curr.osc < next.osc && curr.osc < -0.02) {
+            if (!markers.length || curr.year - markers[markers.length-1].year > 1.5) {
+              markers.push({ year: curr.year, osc: curr.osc, type: 'trough' });
+            }
+          }
+        }
+        return markers.map((m, i) => {
+          const x = xScale(m.year);
+          const isPeak = m.type === 'peak';
+          const color = isPeak ? '#22c55e' : '#ef4444';
+          const label = isPeak ? 'Peak' : 'Trough';
+          const yr = Math.floor(m.year);
+          const mo = Math.floor((m.year % 1) * 12) + 1;
+          const tAtMarker = daysSinceGenesis(new Date(yr, mo - 1, 1));
+          const impliedPrice = powerLawPrice(tAtMarker, MODELS.median) * Math.exp(m.osc);
+          const priceLabel = impliedPrice >= 1e6 ? `$${(impliedPrice/1e6).toFixed(1)}M` : `$${(impliedPrice/1e3).toFixed(0)}k`;
+          const labelY = isPeak ? PAD.top + 1 : PAD.top + plotH - 25;
+          return (
+            <g key={i}>
+              <line x1={x} y1={PAD.top} x2={x} y2={PAD.top + plotH}
+                stroke={color} strokeWidth="1" strokeDasharray="4,4" opacity="0.5" />
+              <rect x={x - 26} y={labelY} width="52" height="24" fill="#0f172a" opacity="0.85" rx="3" />
+              <text x={x} y={labelY + 10} fill={color} fontSize="7.5" textAnchor="middle" fontWeight="bold">
+                {label} ~{mo}/{yr}
+              </text>
+              <text x={x} y={labelY + 20} fill={color} fontSize="7" textAnchor="middle" opacity="0.7">
+                ~{priceLabel}
+              </text>
+            </g>
+          );
+        });
+      })()}
+
+      {/* Current position */}
+      <line x1={xScale(currentYear)} y1={PAD.top} x2={xScale(currentYear)} y2={PAD.top + plotH}
+        stroke="#fbbf24" strokeWidth="1" strokeDasharray="3,3" opacity="0.7" />
+      <circle cx={xScale(currentYear)} cy={yScale(currentOsc)} r="5"
+        fill="#c084fc" stroke="#fff" strokeWidth="1.5" />
+      <text x={xScale(currentYear) + 8} y={yScale(currentOsc) - 6}
+        fill="#c084fc" fontSize="9" fontWeight="bold">
+        {currentOsc > 0 ? '+' : ''}{currentOsc.toFixed(2)}
+      </text>
+    </svg>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// GAUGE COMPONENT
+// ---------------------------------------------------------------------------
+
+function ValueGauge({ ratio }) {
+  const clampedRatio = Math.max(0.3, Math.min(4.0, ratio));
+  const pct = ((clampedRatio - 0.3) / (4.0 - 0.3)) * 100;
+
+  return (
+    <div className="relative w-full h-6 rounded-full overflow-hidden" style={{
+      background: 'linear-gradient(to right, #16a34a, #22c55e, #86efac, #fbbf24, #f97316, #ef4444, #991b1b)'
+    }}>
+      <div className="absolute top-0 h-full w-0.5 bg-white" style={{
+        left: `${pct}%`, boxShadow: '0 0 6px rgba(255,255,255,0.8)'
+      }}>
+        <div className="absolute -top-5 left-1/2 -translate-x-1/2 text-white text-xs font-bold bg-slate-800 px-1.5 py-0.5 rounded whitespace-nowrap">
+          {(ratio * 100).toFixed(0)}%
+        </div>
+      </div>
+      <div className="absolute inset-0 flex items-center justify-between px-2 text-xs font-medium text-white/70"
+        style={{ textShadow: '0 1px 2px rgba(0,0,0,0.5)' }}>
+        <span>Deep Value</span>
+        <span>Fair</span>
+        <span>Euphorie</span>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// CYCLE PHASE INDICATOR
+// ---------------------------------------------------------------------------
+
+function CyclePhaseIndicator({ tNow, btcPrice, fairValue }) {
+  const osc = oscillationValue(tNow);
+
+  // Compute derivative (finite difference)
+  const dt = 1; // 1 day
+  const oscNext = oscillationValue(tNow + dt);
+  const derivative = oscNext - osc;
+
+  // Phase classification — thresholds for full fit amplitudes (range ≈ ±1.2)
+  let phase, phaseColor, phaseIcon;
+  if (osc > 0.5 && derivative < 0) {
+    phase = "Peak-Rollover"; phaseColor = "#ef4444"; phaseIcon = "↘";
+  } else if (osc > 0.25 && derivative > 0) {
+    phase = "Anstieg (spät)"; phaseColor = "#f97316"; phaseIcon = "↗";
+  } else if (osc > 0 && derivative > 0) {
+    phase = "Anstieg (früh)"; phaseColor = "#22c55e"; phaseIcon = "↗";
+  } else if (osc < -0.5 && derivative > 0) {
+    phase = "Trough-Erholung"; phaseColor = "#22c55e"; phaseIcon = "↗";
+  } else if (osc < -0.25 && derivative < 0) {
+    phase = "Korrektur (spät)"; phaseColor = "#dc2626"; phaseIcon = "↘";
+  } else if (osc < 0 && derivative < 0) {
+    phase = "Korrektur (früh)"; phaseColor = "#f97316"; phaseIcon = "↘";
+  } else if (derivative > 0) {
+    phase = "Neutral/Ansteigend"; phaseColor = "#86efac"; phaseIcon = "→";
+  } else {
+    phase = "Neutral/Fallend"; phaseColor = "#fbbf24"; phaseIcon = "→";
+  }
+
+  // Find next peak and trough (local extrema in the oscillation)
+  let nextPeakT = null, nextTroughT = null;
+  let prevOsc = oscillationValue(tNow);
+  let wasDecreasing = false, wasIncreasing = false;
+  for (let dt2 = 1; dt2 < 5475; dt2 += 1) {  // scan 15 years
+    const t = tNow + dt2;
+    const currOsc = oscillationValue(t);
+    
+    // Peak: was increasing, now decreasing, and value is positive
+    if (!nextPeakT && wasIncreasing && currOsc < prevOsc && prevOsc > 0.15) {
+      nextPeakT = dt2 - 1;
+    }
+    // Trough: was decreasing, now increasing, and value is negative or near zero
+    if (!nextTroughT && wasDecreasing && currOsc > prevOsc && prevOsc < 0) {
+      nextTroughT = dt2 - 1;
+    }
+    
+    wasIncreasing = currOsc > prevOsc;
+    wasDecreasing = currOsc < prevOsc;
+    prevOsc = currOsc;
+    if (nextPeakT && nextTroughT) break;
+  }
+
+  const peakDate = nextPeakT ? new Date(Date.now() + nextPeakT * MS_PER_DAY) : null;
+  const troughDate = nextTroughT ? new Date(Date.now() + nextTroughT * MS_PER_DAY) : null;
+  const fmtDate = (d) => d ? `${d.getMonth()+1}/${d.getFullYear()}` : "—";
+
+  // Actual deviation from trend
+  const actualDev = Math.log(btcPrice / fairValue);
+  const divergence = actualDev - osc;
+
+  return (
+    <div className="space-y-2">
+      <div className="grid grid-cols-4 gap-2">
+        <div className="bg-slate-800/60 rounded-lg p-3 text-center">
+          <p className="text-xs text-slate-500 uppercase tracking-wider mb-1">Zyklusphase</p>
+          <p className="text-base font-bold" style={{ color: phaseColor }}>
+            {phaseIcon} {phase}
+          </p>
+        </div>
+        <div className="bg-slate-800/60 rounded-lg p-3 text-center">
+          <p className="text-xs text-slate-500 uppercase tracking-wider mb-1">Modell-Erwartung</p>
+          <p className="text-base font-bold font-mono" style={{ color: osc > 0 ? '#22c55e' : '#ef4444' }}>
+            {osc > 0 ? '+' : ''}{(Math.exp(osc)*100 - 100).toFixed(0)}%
+          </p>
+          <p className="text-xs text-slate-600 mt-0.5">
+            {osc > 0 ? 'über' : 'unter'} Trend (Osc {osc > 0 ? '+' : ''}{osc.toFixed(2)})
+          </p>
+        </div>
+        <div className="bg-slate-800/60 rounded-lg p-3 text-center">
+          <p className="text-xs text-slate-500 uppercase tracking-wider mb-1">Tatsächlich</p>
+          <p className="text-base font-bold font-mono" style={{ color: actualDev > 0 ? '#22c55e' : '#ef4444' }}>
+            {actualDev > 0 ? '+' : ''}{(Math.exp(actualDev)*100 - 100).toFixed(0)}%
+          </p>
+          <p className="text-xs text-slate-600 mt-0.5">
+            {actualDev > 0 ? 'über' : 'unter'} Trend (${(btcPrice/1000).toFixed(0)}k vs ${(fairValue/1000).toFixed(0)}k)
+          </p>
+        </div>
+        <div className="bg-slate-800/60 rounded-lg p-3 text-center border" style={{ borderColor: Math.abs(divergence) > 0.3 ? '#f59e0b' : '#334155' }}>
+          <p className="text-xs text-slate-500 uppercase tracking-wider mb-1">Divergenz</p>
+          <p className="text-base font-bold font-mono" style={{ color: '#f59e0b' }}>
+            {(divergence * 100).toFixed(0)}pp
+          </p>
+          <p className="text-xs text-slate-600 mt-0.5">
+            {Math.abs(divergence) > 0.5 ? 'Exogener Druck' : Math.abs(divergence) > 0.2 ? 'Moderate Abweichung' : 'Im Rahmen'}
+          </p>
+        </div>
+      </div>
+      <div className="bg-slate-800/60 rounded-lg px-3 py-2 flex justify-center gap-6 text-xs text-slate-400">
+        <span>
+          <span className="text-green-400">Nächster Peak:</span> ~{fmtDate(peakDate)}
+          {nextPeakT && <span className="text-slate-600"> ({Math.round(nextPeakT/30)}M)</span>}
+        </span>
+        <span>
+          <span className="text-red-400">Nächster Trough:</span> ~{fmtDate(troughDate)}
+          {nextTroughT && <span className="text-slate-600"> ({Math.round(nextTroughT/30)}M)</span>}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// MAIN DASHBOARD
+// ---------------------------------------------------------------------------
+
+function BTCPowerLawMonitor() {
+  const [btcPrice, setBtcPrice] = useState(68500);
+  const [customDate, setCustomDate] = useState(() => new Date().toISOString().split('T')[0]);
+  const [showOscillation, setShowOscillation] = useState(true);
+  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [lastUpdate, setLastUpdate] = useState(null);
+  const [fetchStatus, setFetchStatus] = useState('idle'); // 'idle' | 'loading' | 'ok' | 'error'
+
+  const fetchPrice = useCallback(async () => {
+    setFetchStatus('loading');
+    try {
+      const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (data?.bitcoin?.usd) {
+        setBtcPrice(Math.round(data.bitcoin.usd));
+        setCustomDate(new Date().toISOString().split('T')[0]);
+        setLastUpdate(new Date());
+        setFetchStatus('ok');
+      } else {
+        throw new Error('No price data');
+      }
+    } catch (err) {
+      console.error('Price fetch failed:', err);
+      setFetchStatus('error');
+    }
+  }, []);
+
+  // Fetch on mount
+  useEffect(() => { fetchPrice(); }, [fetchPrice]);
+
+  // Auto-refresh every 60 seconds
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const interval = setInterval(fetchPrice, 60000);
+    return () => clearInterval(interval);
+  }, [autoRefresh, fetchPrice]);
+
+  const currentDate = new Date(customDate);
+  const tNow = daysSinceGenesis(currentDate);
+
+  const fairValue = powerLawPrice(tNow, MODELS.median);
+  const floorValue = powerLawPrice(tNow, MODELS.floor);
+  const ceilingValue = powerLawPrice(tNow, MODELS.ceiling);
+  const oscAdjustedFV = powerLawWithOscillation(tNow, MODELS.median);
+  const ratio = btcPrice / fairValue;
+  const oscRatio = btcPrice / oscAdjustedFV;
+  const zone = getZone(btcPrice, fairValue);
+  const takeProfits = getTakeProfitLevels(fairValue);
+
+  // Projections
+  const projections = [
+    { label: "6 Monate", days: 182 },
+    { label: "1 Jahr", days: 365 },
+    { label: "2 Jahre", days: 730 },
+    { label: "3 Jahre", days: 1095 },
+    { label: "5 Jahre", days: 1825 },
+    { label: "10 Jahre", days: 3650 },
+  ].map(p => {
+    const t = tNow + p.days;
+    return {
+      ...p,
+      floor: powerLawPrice(t, MODELS.floor),
+      median: powerLawPrice(t, MODELS.median),
+      ceiling: powerLawPrice(t, MODELS.ceiling),
+      oscMedian: powerLawWithOscillation(t, MODELS.median),
+    };
+  });
+
+  return (
+    <div className="min-h-screen bg-slate-950 text-white p-4" style={{ fontFamily: 'system-ui, -apple-system, sans-serif' }}>
+      <div className="max-w-3xl mx-auto space-y-4">
+
+        {/* Header */}
+        <div className="text-center space-y-1">
+          <h1 className="text-2xl font-bold text-amber-400">BTC Power Law Monitor</h1>
+          <p className="text-slate-400 text-sm">Skaleninvariante Regression (w=1/t) + Log-Periodische Oszillation</p>
+        </div>
+
+        {/* Input Controls */}
+        <div className="bg-slate-900 rounded-xl p-4 border border-slate-800">
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="text-xs text-slate-400 uppercase tracking-wider flex items-center gap-2">
+                BTC Preis (USD)
+                {fetchStatus === 'ok' && <span className="text-green-400 text-xs">● Live</span>}
+                {fetchStatus === 'loading' && <span className="text-amber-400 text-xs">⟳</span>}
+                {fetchStatus === 'error' && <span className="text-red-400 text-xs">● Offline</span>}
+              </label>
+              <input type="number" value={btcPrice}
+                onChange={(e) => { setBtcPrice(Number(e.target.value)); setAutoRefresh(false); }}
+                className="w-full mt-1 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-lg font-mono text-white focus:outline-none focus:border-amber-500" />
+            </div>
+            <div>
+              <label className="text-xs text-slate-400 uppercase tracking-wider">Datum</label>
+              <input type="date" value={customDate}
+                onChange={(e) => { setCustomDate(e.target.value); setAutoRefresh(false); }}
+                className="w-full mt-1 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-lg text-white focus:outline-none focus:border-amber-500" />
+            </div>
+          </div>
+          <div className="mt-3 flex items-center gap-2 flex-wrap">
+            <button
+              onClick={() => setShowOscillation(!showOscillation)}
+              className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors ${showOscillation ? 'bg-purple-900/50 text-purple-300 border border-purple-700' : 'bg-slate-800 text-slate-500 border border-slate-700'}`}>
+              Log-Periodisch {showOscillation ? 'AN' : 'AUS'}
+            </button>
+            <button
+              onClick={() => { setAutoRefresh(!autoRefresh); if (!autoRefresh) fetchPrice(); }}
+              className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors ${autoRefresh ? 'bg-green-900/50 text-green-300 border border-green-700' : 'bg-slate-800 text-slate-500 border border-slate-700'}`}>
+              Auto-Refresh {autoRefresh ? 'AN (60s)' : 'AUS'}
+            </button>
+            <button
+              onClick={fetchPrice}
+              className="px-3 py-1 rounded-lg text-xs font-medium bg-slate-800 text-slate-400 border border-slate-700 hover:border-amber-600 hover:text-amber-400 transition-colors">
+              Jetzt laden
+            </button>
+            {lastUpdate && (
+              <span className="text-xs text-slate-600">
+                Letztes Update: {lastUpdate.toLocaleTimeString('de-DE')}
+              </span>
+            )}
+          </div>
+          <div className="mt-2">
+            <span className="text-xs text-slate-600">R² = {OSCILLATION.rSquared} | λ ≈ {OSCILLATION.lambda} | ω = {OSCILLATION.omega} | δ = {OSCILLATION.ampDecay.toFixed(3)} | 5704 pts</span>
+          </div>
+        </div>
+
+        {/* Zone Indicator */}
+        <div className="bg-slate-900 rounded-xl p-4 border border-slate-800 space-y-3">
+          <div className="flex items-center justify-between">
+            <div>
+              <span className="text-xl font-bold" style={{ color: zone.color }}>{zone.label}</span>
+              <p className="text-slate-400 text-sm mt-1">
+                Preis / Fair Value: <span className="text-white font-mono">{(ratio * 100).toFixed(1)}%</span>
+                {showOscillation && (
+                  <span className="text-slate-600 ml-2">
+                    | vs. Osc.-Adjusted: <span className="text-purple-300 font-mono">{(oscRatio * 100).toFixed(1)}%</span>
+                  </span>
+                )}
+              </p>
+            </div>
+            <div className="text-right">
+              <p className="text-xs text-slate-500">AKTION</p>
+              <p className="text-sm font-medium" style={{ color: zone.color }}>{zone.action}</p>
+            </div>
+          </div>
+          <ValueGauge ratio={ratio} />
+        </div>
+
+        {/* Current Values */}
+        <div className="grid grid-cols-4 gap-2">
+          <div className="bg-slate-900 rounded-xl p-3 border border-slate-800 text-center">
+            <p className="text-xs text-green-400 uppercase tracking-wider">Floor</p>
+            <p className="text-base font-bold font-mono text-green-300">{fmt(floorValue)}</p>
+            <p className="text-xs text-slate-600">d=0, β=5.10</p>
+          </div>
+          <div className="bg-slate-900 rounded-xl p-3 border border-amber-800/50 text-center">
+            <p className="text-xs text-amber-400 uppercase tracking-wider">Median</p>
+            <p className="text-base font-bold font-mono text-amber-300">{fmt(fairValue)}</p>
+            <p className="text-xs text-slate-600">d=0.029</p>
+          </div>
+          {showOscillation && (
+            <div className="bg-slate-900 rounded-xl p-3 border border-purple-800/50 text-center">
+              <p className="text-xs text-purple-400 uppercase tracking-wider">Osc. Median</p>
+              <p className="text-base font-bold font-mono text-purple-300">{fmt(oscAdjustedFV)}</p>
+              <p className="text-xs text-slate-600">+Log-Period.</p>
+            </div>
+          )}
+          <div className="bg-slate-900 rounded-xl p-3 border border-slate-800 text-center">
+            <p className="text-xs text-red-400 uppercase tracking-wider">Ceiling</p>
+            <p className="text-base font-bold font-mono text-red-300">{fmt(ceilingValue)}</p>
+            <p className="text-xs text-slate-600">d=0.045</p>
+          </div>
+        </div>
+
+        {/* Cycle Phase (Log-Periodic) */}
+        {showOscillation && (
+          <div className="bg-slate-900 rounded-xl p-4 border border-purple-900/30 space-y-3">
+            <h2 className="text-sm font-semibold text-purple-300">Zyklusposition (Diskrete Skaleninvarianz)</h2>
+            <CyclePhaseIndicator tNow={tNow} btcPrice={btcPrice} fairValue={fairValue} />
+            <OscillationChart currentDate={currentDate} />
+            <p className="text-xs text-slate-600 text-center">
+              Punkte = historische Residuen (ln(Preis/Median)) | Linie = log-periodisches Modell (ω, 2ω, 3ω, 4ω)
+            </p>
+          </div>
+        )}
+
+        {/* Power Law Chart */}
+        <div className="bg-slate-900 rounded-xl p-4 border border-slate-800">
+          <h2 className="text-sm font-semibold text-slate-300 mb-2">Power Law Bänder (log-Skala)</h2>
+          <PowerLawChart currentPrice={btcPrice} currentDate={currentDate} showOscillation={showOscillation} />
+        </div>
+
+        {/* Take Profit Levels */}
+        <div className="bg-slate-900 rounded-xl p-4 border border-slate-800">
+          <h2 className="text-sm font-semibold text-slate-300 mb-3">Take-Profit Trigger</h2>
+          <div className="space-y-1.5">
+            {takeProfits.map((tp, i) => {
+              const isActive = btcPrice >= tp.price;
+              const isNext = i > 0 && btcPrice < tp.price && btcPrice >= takeProfits[i - 1].price;
+              return (
+                <div key={i} className={`flex items-center justify-between px-3 py-2 rounded-lg text-sm ${isActive ? 'bg-red-900/30 border border-red-800/50' : isNext ? 'bg-amber-900/20 border border-amber-800/30' : 'bg-slate-800/50'}`}>
+                  <div className="flex items-center gap-2">
+                    <div className={`w-2 h-2 rounded-full ${isActive ? 'bg-red-400' : 'bg-slate-600'}`} />
+                    <span className={isActive ? 'text-red-300' : 'text-slate-400'}>{tp.level}</span>
+                  </div>
+                  <div className="flex items-center gap-4">
+                    <span className="font-mono text-slate-300">{fmt(tp.price)}</span>
+                    <span className="text-xs text-slate-500 w-12 text-right">{tp.pct}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Projections */}
+        <div className="bg-slate-900 rounded-xl p-4 border border-slate-800">
+          <h2 className="text-sm font-semibold text-slate-300 mb-3">Fair-Value-Projektionen</h2>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-slate-500 text-xs uppercase">
+                  <th className="text-left py-1.5 px-2">Horizont</th>
+                  <th className="text-right py-1.5 px-2">Floor</th>
+                  <th className="text-right py-1.5 px-2">Median</th>
+                  {showOscillation && <th className="text-right py-1.5 px-2">Osc. Median</th>}
+                  <th className="text-right py-1.5 px-2">Ceiling</th>
+                </tr>
+              </thead>
+              <tbody>
+                {projections.map((p, i) => (
+                  <tr key={i} className={i % 2 === 0 ? 'bg-slate-800/30' : ''}>
+                    <td className="py-1.5 px-2 text-slate-300">{p.label}</td>
+                    <td className="py-1.5 px-2 text-right font-mono text-green-400">{fmt(p.floor)}</td>
+                    <td className="py-1.5 px-2 text-right font-mono text-amber-400 font-semibold">{fmt(p.median)}</td>
+                    {showOscillation && (
+                      <td className="py-1.5 px-2 text-right font-mono text-purple-400">{fmt(p.oscMedian)}</td>
+                    )}
+                    <td className="py-1.5 px-2 text-right font-mono text-red-400">{fmt(p.ceiling)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* DCA Multiplier */}
+        <div className="bg-slate-900 rounded-xl p-4 border border-slate-800">
+          <h2 className="text-sm font-semibold text-slate-300 mb-3">DCA-Multiplikator</h2>
+          <div className="flex items-center gap-4">
+            <div className="text-center flex-1">
+              <div className="text-3xl font-bold font-mono" style={{ color: zone.color }}>
+                {ratio < 0.55 ? '3.0×' : ratio < 0.75 ? '2.0×' : ratio < 0.95 ? '1.5×' : ratio < 1.15 ? '1.0×' : ratio < 1.5 ? '0.5×' : ratio < 2.0 ? '0.25×' : '0×'}
+              </div>
+              <p className="text-xs text-slate-500 mt-1">des Basis-DCA-Betrags</p>
+            </div>
+            <div className="flex-1 text-sm text-slate-400 space-y-0.5">
+              <p><span className="text-green-500">●</span> {'<'}55% → 3× (Deep Value)</p>
+              <p><span className="text-green-400">●</span> 55-75% → 2× (Akkumulation)</p>
+              <p><span className="text-lime-300">●</span> 75-95% → 1.5× (Unterbewertet)</p>
+              <p><span className="text-amber-400">●</span> 95-115% → 1× (Fair Value)</p>
+              <p><span className="text-orange-400">●</span> 115-150% → 0.5× (Überbew.)</p>
+              <p><span className="text-red-400">●</span> {'>'}150% → 0.25× (Zyklusreife)</p>
+            </div>
+          </div>
+        </div>
+
+        {/* Model Documentation */}
+        <div className="bg-slate-800/50 rounded-xl p-4 text-xs text-slate-500 space-y-2">
+          <p className="font-semibold text-slate-400">Zwei-Schichten-Modell</p>
+          <p className="text-slate-400 italic">
+            ln(P) = [a + (β − d·ln(t))·ln(t)] + Σ Cₙ·cos(nω·ln(t) + φₙ)
+          </p>
+          <p>
+            <span className="text-amber-500 font-semibold">Schicht 1 — Trend (Decay Power Law):</span>{' '}
+            Skaleninvariante Quantil-Regression (τ=0.50) mit Jacobian w(t)=1/t.
+            8 unabhängige Decay-Funktionen konvergieren auf d≈0.029 am Median
+            und ~$101k Fair Value heute. Konstanter Exponent (d=0) wird verworfen —
+            außer am Floor, wo Support beschleunigt (d{'<'}0). Simpsons Paradox:
+            der Aggregat-Exponent erscheint stabil, aber Quantilstruktur zeigt Decay oben,
+            Beschleunigung unten. Kalibriert: ~$101k heute, ~$375k in 5J, ~$1.07M in 10J.
+          </p>
+          <p>
+            <span className="text-green-500">Floor (Q1):</span> d=0, β=5.10 — konsistent ~45% unter Median.{' '}
+            <span className="text-red-500">Ceiling:</span> d=0.045, β=5.90 — komprimiert über Zeit, ~60% über Median.
+          </p>
+          <p>
+            <span className="text-purple-500 font-semibold">Schicht 2 — Oszillation (mit Amplituden-Decay):</span>{' '}
+            osc(t) = Σ Cₙ · t^(-δ) · cos(nω·ln(t)+φₙ). ω=8.894 fixiert (λ=2.027),
+            δ=0.684 per Grid-Search. 5.704 tägliche Datenpunkte.
+            R²=0.605 (+12pp vs. ohne Amplituden-Decay). Effektive Amplitude
+            der Fundamentale schrumpft: 0.62 dex (2011) → 0.22 (2017) → 0.14 (2025) → 0.12 (2028).
+            Peak-Projektion 2028: ~$265k statt ~$537k ohne Dämpfung.
+          </p>
+          <p className="text-amber-500">
+            <span className="font-semibold">⚠ Divergenz heute:</span>{' '}
+            Modell sagt +11% vs. Trend, Realität ist −32%.
+            Die ~49pp Lücke (reduziert von 76pp ohne Amp-Decay) repräsentiert
+            exogene Faktoren (Iran-Konflikt, Makro). Timing-Struktur ist belastbar
+            (out-of-sample validiert), Preis-Amplituden sind approximativ.
+          </p>
+          <p className="text-amber-600 mt-2 font-semibold">
+            Kein Finanzprodukt. Modellbasierte Orientierung, keine Preisprognose.
+            Eigene Verifikation erforderlich.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+    const rootEl = document.getElementById('root');
+    const root = ReactDOM.createRoot(rootEl);
+    root.render(React.createElement(BTCPowerLawMonitor));
+  </script>
+</body>
+</html>
