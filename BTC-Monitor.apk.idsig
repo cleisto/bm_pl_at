@@ -1,1 +1,1 @@
-PLACEHOLDER4
+$(cat /tmp/idsig_val.txt)
