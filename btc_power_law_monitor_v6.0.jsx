@@ -1,0 +1,2064 @@
+// BTC Power Law Monitor v6.0 — Consolidated
+// Drei-Schichten-Modell: Decay PL + Log-Periodische Oszillation (Amp-Decay) + Makro (PMI)
+// ±1σ Prediction Bands | Peak-Fenster (±3M MAE) | Gold/BTC Rotation Signal | Live CoinGecko
+import { useState, useMemo, useEffect, useCallback } from "react";
+
+// ============================================================================
+// BTC POWER LAW MONITOR v2
+// Skaleninvariante Quantil-Regression mit Exponent-Decay + Log-Periodische Oszillation
+// ============================================================================
+
+// Genesis: April 6, 2009
+const GENESIS = new Date("2009-04-06").getTime();
+const MS_PER_DAY = 86400000;
+
+// ---------------------------------------------------------------------------
+// MODEL PARAMETERS — calibrated to scale-invariant quantile regression (w=1/t)
+//
+// Decay model: ln(P) = a + (β − d·ln(t))·ln(t)   where t = days since genesis
+//
+// Research findings:
+//   - 8 independent decay functions converge on d ≈ 0.029 at the median
+//   - Floor (Q1) has d ≈ 0 (no decay) — support accelerates
+//   - Ceiling has d > 0.029 — upper bound decays faster
+//   - Constant exponent (d=0) rejected at median: Simpson's Paradox
+//
+// Calibration targets (derived from research table):
+//   Median:  today ~$101k,  5yr ~$375k,  10yr ~$1.07M
+//   Floor:   today ~$56k,   5yr ~$209k,  10yr ~$594k   (~45% below median)
+//   Ceiling: today ~$160k,  5yr ~$597k,  10yr ~$1.69M  (~60% above median)
+// ---------------------------------------------------------------------------
+
+const MODELS = {
+  floor:   { beta: 5.10,  d: 0.000, targetToday: 56000,   label: "Floor (Q1)",        color: "#22c55e", desc: "Kein Decay, niedrigerer β" },
+  median:  { beta: 5.60,  d: 0.029, targetToday: 101000,  label: "Median Fair Value",  color: "#f59e0b", desc: "Decay d=0.029" },
+  ceiling: { beta: 5.90,  d: 0.045, targetToday: 160000,  label: "Obere Begrenzung",   color: "#ef4444", desc: "Stärkerer Decay d=0.045" },
+};
+
+// ---------------------------------------------------------------------------
+// COMPARISON: Simple Power Law (no decay, no w=1/t correction)
+// This is what most published BTC Power Law models use.
+// OLS regression of ln(price) on ln(t) — biased toward recent data.
+// Included as reference so users can see the difference.
+//   Median (OLS): ~$130k today, ~$542k 5yr, ~$1.69M 10yr
+//   Median (Linear QR): ~$118k today, ~$504k 5yr, ~$1.60M 10yr
+// ---------------------------------------------------------------------------
+
+const SIMPLE_PL = {
+  beta: 4.89,  // constant exponent (no decay)
+  d: 0.0,
+  targetToday: 118000,  // Linear Quantile Regression median (from research table)
+  label: "Einfaches PL (kein Decay)",
+  color: "#64748b",
+  desc: "Konventionell, keine Skaleninvarianz",
+};
+
+// ---------------------------------------------------------------------------
+// PREDICTION BAND: ±1σ around oscillation-adjusted median
+// σ = 0.56 in ln-space (historical residuals vs full model)
+// σ shrinks over time: 0.57 (2013–19) → 0.32 (2022–26)
+// ---------------------------------------------------------------------------
+const MODEL_SIGMA = 0.5609;  // in ln(price) space
+
+// ---------------------------------------------------------------------------
+// LOG-PERIODIC OSCILLATION (Discrete Scale Invariance)
+//
+// After removing the power law trend, the residual follows:
+//   r(t) = Σ Cₙ · cos(n·ω·ln(t) + φₙ)    (harmonics n = 1,2,3,4)
+//
+// λ ≈ 2.0 → ω = 2π/ln(λ) ≈ 9.06
+// Phase calibrated so fundamental peaks near Oct 2025 ATH ($126k)
+// R² ≈ 0.445 — explains ~45% of variance in residuals
+//
+// ⚠️  These parameters are approximate. The amplitudes and phases are
+//     estimated to reproduce known cycle peaks qualitatively.
+//     For production use, fit against actual daily price data.
+// ---------------------------------------------------------------------------
+
+const OSCILLATION = {
+  // ---------------------------------------------------------------------------
+  // FULL PRODUCTION FIT WITH AMPLITUDE DECAY
+  // 5,704 daily points (2010-07 to 2026-03)
+  // osc(t) = Σ Cₙ · t^(-δ) · cos(n·ω·ln(t) + φₙ)
+  //
+  // ω = 8.894 fixed from DSI research. δ = 0.684 found via grid search.
+  // Amplitudes + phases fitted via weighted LS (w=1/t) on Decay-PL residuals.
+  // ---------------------------------------------------------------------------
+  omega: 8.894,
+  lambda: 2.027,
+  ampDecay: 0.68357,  // δ: amplitude damping, Cₙ·t^(-δ)
+  harmonics: [
+    { n: 1, C: 118.05080, phi: 3.06676 },  // fundamental
+    { n: 2, C: 45.27629, phi: 0.04083 },   // 2ω
+    { n: 3, C: 17.11566, phi: 3.10856 },   // 3ω
+    { n: 4, C: 8.55485, phi: -0.57302 },   // 4ω
+  ],
+  rSquared: 0.605,
+  // ---------------------------------------------------------------------------
+  // AMPLITUDE DECAY INSIGHT:
+  //   R² improves 0.487 → 0.605 (+12pp). δ=0.684 means each harmonic's
+  //   effective amplitude shrinks as t^(-0.68). Concrete effect on fundamental:
+  //     2011: B_eff=0.62 dex | 2017: 0.22 | 2021: 0.17 | 2025: 0.14 | 2028: 0.12
+  //   This resolves the out-of-sample amplitude overshoot documented in the
+  //   DSI research (R²_oos = −3.50 without decay).
+  //
+  //   PRACTICAL IMPACT: Peak projection 2027-28 drops from ~$537k to ~$265k.
+  //   The timing structure (ω, phases) is unchanged — only the magnitude
+  //   of the oscillation is damped, matching the empirical observation that
+  //   each successive cycle produces smaller proportional moves.
+  //
+  // Validation: 4/6 peaks ✓, 3/4 troughs ✓ (same as before — timing unchanged)
+  // Divergence today: 49pp (down from 76pp without amp decay)
+  // ---------------------------------------------------------------------------
+};
+
+// ---------------------------------------------------------------------------
+// ISM MANUFACTURING PMI — Business Cycle Overlay
+//
+// Regression of BTC Power Law Residual on ISM PMI (monthly):
+//   2nd half (2018–2025): R² = 0.511, p = 4.2e-12
+//   residual = β·PMI + α  →  PMI-adjusted FV = Median × exp(β·PMI + α)
+//   β ≈ 0.037, α ≈ -1.90
+// Source: ISM via FRED (Series: NAPM). Updated monthly (1st business day).
+// ---------------------------------------------------------------------------
+
+const PMI_REGRESSION = {
+  beta: 0.037,     // slope: +1 PMI point ≈ +3.7% on BTC residual
+  alpha: -1.90,    // intercept
+  rSquared: 0.511, // 2nd half (2018-2025)
+};
+
+// Historical ISM Manufacturing PMI (monthly, end-of-month values)
+// Source: ISM / FRED NAPM series. Publicly available data.
+const PMI_HISTORY = [
+  // [year_fraction, pmi_value]
+  // 2010
+  [2010.04, 57.0], [2010.12, 56.5], [2010.21, 57.8], [2010.29, 60.4], [2010.37, 59.7], [2010.46, 56.2],
+  [2010.54, 55.5], [2010.62, 56.3], [2010.71, 54.4], [2010.79, 56.9], [2010.87, 56.6], [2010.96, 57.0],
+  // 2011
+  [2011.04, 59.1], [2011.12, 60.8], [2011.21, 61.2], [2011.29, 60.6], [2011.37, 53.5], [2011.46, 55.3],
+  [2011.54, 50.9], [2011.62, 51.6], [2011.71, 51.2], [2011.79, 51.8], [2011.87, 52.7], [2011.96, 53.1],
+  // 2012
+  [2012.04, 53.5], [2012.12, 52.4], [2012.21, 53.4], [2012.29, 53.5], [2012.37, 53.5], [2012.46, 49.8],
+  [2012.54, 49.8], [2012.62, 49.6], [2012.71, 51.5], [2012.79, 51.7], [2012.87, 49.9], [2012.96, 50.7],
+  // 2013
+  [2013.04, 52.3], [2013.12, 54.2], [2013.21, 51.3], [2013.29, 50.7], [2013.37, 49.0], [2013.46, 50.9],
+  [2013.54, 55.4], [2013.62, 55.7], [2013.71, 56.2], [2013.79, 56.4], [2013.87, 57.0], [2013.96, 57.0],
+  // 2014
+  [2014.04, 51.3], [2014.12, 53.2], [2014.21, 53.7], [2014.29, 54.9], [2014.37, 55.4], [2014.46, 55.3],
+  [2014.54, 57.1], [2014.62, 57.9], [2014.71, 56.6], [2014.79, 58.7], [2014.87, 58.7], [2014.96, 55.1],
+  // 2015
+  [2015.04, 53.5], [2015.12, 52.9], [2015.21, 51.5], [2015.29, 51.5], [2015.37, 52.8], [2015.46, 53.5],
+  [2015.54, 52.7], [2015.62, 51.1], [2015.71, 50.2], [2015.79, 50.1], [2015.87, 48.6], [2015.96, 48.2],
+  // 2016
+  [2016.04, 48.2], [2016.12, 49.5], [2016.21, 51.8], [2016.29, 50.8], [2016.37, 51.3], [2016.46, 53.2],
+  [2016.54, 52.6], [2016.62, 51.5], [2016.71, 51.5], [2016.79, 51.9], [2016.87, 53.2], [2016.96, 54.7],
+  // 2017
+  [2017.04, 56.0], [2017.12, 57.7], [2017.21, 57.2], [2017.29, 54.8], [2017.37, 54.9], [2017.46, 57.8],
+  [2017.54, 56.3], [2017.62, 58.8], [2017.71, 60.8], [2017.79, 58.7], [2017.87, 58.2], [2017.96, 59.3],
+  // 2018
+  [2018.04, 59.1], [2018.12, 60.8], [2018.21, 59.3], [2018.29, 57.3], [2018.37, 58.7], [2018.46, 60.2],
+  [2018.54, 58.1], [2018.62, 61.3], [2018.71, 59.8], [2018.79, 57.7], [2018.87, 59.3], [2018.96, 54.3],
+  // 2019
+  [2019.04, 56.6], [2019.12, 54.2], [2019.21, 55.3], [2019.29, 52.8], [2019.37, 52.1], [2019.46, 51.7],
+  [2019.54, 51.2], [2019.62, 49.1], [2019.71, 47.8], [2019.79, 48.3], [2019.87, 48.1], [2019.96, 47.8],
+  // 2020
+  [2020.04, 50.9], [2020.12, 50.1], [2020.21, 49.1], [2020.29, 41.5], [2020.37, 43.1], [2020.46, 52.6],
+  [2020.54, 54.2], [2020.62, 56.0], [2020.71, 55.4], [2020.79, 59.3], [2020.87, 57.5], [2020.96, 60.7],
+  // 2021
+  [2021.04, 58.7], [2021.12, 60.8], [2021.21, 64.7], [2021.29, 60.7], [2021.37, 61.2], [2021.46, 60.6],
+  [2021.54, 59.5], [2021.62, 59.9], [2021.71, 61.1], [2021.79, 60.8], [2021.87, 61.1], [2021.96, 58.8],
+  // 2022
+  [2022.04, 57.6], [2022.12, 58.6], [2022.21, 57.1], [2022.29, 55.4], [2022.37, 56.1], [2022.46, 53.0],
+  [2022.54, 52.8], [2022.62, 52.8], [2022.71, 50.9], [2022.79, 50.2], [2022.87, 49.0], [2022.96, 48.4],
+  // 2023
+  [2023.04, 47.4], [2023.12, 47.7], [2023.21, 46.3], [2023.29, 47.1], [2023.37, 46.9], [2023.46, 46.0],
+  [2023.54, 46.4], [2023.62, 47.6], [2023.71, 49.0], [2023.79, 46.7], [2023.87, 46.7], [2023.96, 47.4],
+  // 2024
+  [2024.04, 49.2], [2024.12, 47.8], [2024.21, 50.3], [2024.29, 49.2], [2024.37, 48.7], [2024.46, 48.5],
+  [2024.54, 46.8], [2024.62, 47.2], [2024.71, 47.2], [2024.79, 46.5], [2024.87, 48.4], [2024.96, 49.3],
+  // 2025
+  [2025.04, 50.9], [2025.12, 50.3], [2025.21, 49.0], [2025.29, 48.7], [2025.37, 48.7], [2025.46, 49.7],
+  [2025.54, 48.8], [2025.62, 47.2], [2025.71, 49.6], [2025.79, 48.3], [2025.87, 48.4], [2025.96, 49.3],
+  // 2026
+  [2026.04, 50.9], [2026.12, 50.3],
+];
+
+function getPmiAdjustedFairValue(pmi, medianFV) {
+  const residualAdj = PMI_REGRESSION.beta * pmi + PMI_REGRESSION.alpha;
+  return medianFV * Math.exp(residualAdj);
+}
+
+function getLatestPmi() {
+  return PMI_HISTORY[PMI_HISTORY.length - 1];
+}
+
+function daysSinceGenesis(date = new Date()) {
+  return (date.getTime() - GENESIS) / MS_PER_DAY;
+}
+
+function powerLawPrice(t, model) {
+  const lnT = Math.log(t);
+  return Math.exp(model.a + (model.beta - model.d * lnT) * lnT);
+}
+
+function oscillationValue(t) {
+  const lnT = Math.log(t);
+  const damping = Math.pow(t, -OSCILLATION.ampDecay);  // t^(-δ): amplitude shrinks over time
+  let val = 0;
+  for (const h of OSCILLATION.harmonics) {
+    val += h.C * damping * Math.cos(h.n * OSCILLATION.omega * lnT + h.phi);
+  }
+  return val; // in ln(price) space — multiply power law by exp(val)
+}
+
+function powerLawWithOscillation(t, model) {
+  return powerLawPrice(t, model) * Math.exp(oscillationValue(t));
+}
+
+// Calibrate 'a' for each model so it hits targetToday at current date
+(function calibrateModels() {
+  const tToday = daysSinceGenesis(new Date("2026-03-23"));
+  const lnT = Math.log(tToday);
+  for (const model of Object.values(MODELS)) {
+    model.a = Math.log(model.targetToday) - (model.beta - model.d * lnT) * lnT;
+  }
+  // Also calibrate comparison model
+  SIMPLE_PL.a = Math.log(SIMPLE_PL.targetToday) - (SIMPLE_PL.beta - SIMPLE_PL.d * lnT) * lnT;
+})();
+
+// ---------------------------------------------------------------------------
+// ZONE CLASSIFICATION
+// ---------------------------------------------------------------------------
+
+function getZone(price, fairValue) {
+  const ratio = price / fairValue;
+  if (ratio < 0.55) return { zone: "DEEP_VALUE",  label: "Deep Value",              color: "#16a34a", bg: "#052e16", action: "DCA verdreifachen + Cash-Reserve deployen" };
+  if (ratio < 0.75) return { zone: "ACCUMULATE",  label: "Akkumulation",            color: "#22c55e", bg: "#14532d", action: "DCA verdoppeln" };
+  if (ratio < 0.95) return { zone: "UNDERVALUED", label: "Unterbewertet",           color: "#86efac", bg: "#1a3a2a", action: "Normales DCA + leichte Aufstockung" };
+  if (ratio < 1.15) return { zone: "FAIR",        label: "Fair Value Zone",         color: "#fbbf24", bg: "#422006", action: "Normales DCA beibehalten" };
+  if (ratio < 1.50) return { zone: "OVERVALUED",  label: "Leicht überbewertet",     color: "#f97316", bg: "#431407", action: "DCA auf 50% reduzieren" };
+  if (ratio < 2.00) return { zone: "ELEVATED",    label: "Signifikant überbewertet",color: "#ef4444", bg: "#450a0a", action: "15% Position trimmen" };
+  if (ratio < 3.00) return { zone: "EUPHORIA",    label: "Zyklusreife",             color: "#dc2626", bg: "#450a0a", action: "Weitere 15-20% trimmen" };
+  return                    { zone: "EXTREME",     label: "Euphorie-Extreme",        color: "#991b1b", bg: "#450a0a", action: "Aggressive Reduktion auf 30%" };
+}
+
+// ---------------------------------------------------------------------------
+// TAKE PROFIT LEVELS
+// ---------------------------------------------------------------------------
+
+function getTakeProfitLevels(fairValue) {
+  return [
+    { level: "Fair Value",              price: fairValue,       action: "DCA normal fortsetzen",   pct: "0%" },
+    { level: "Moderate Überbew.",       price: fairValue * 1.5, action: "DCA auf 50% reduzieren",  pct: "+50%" },
+    { level: "Signifikante Überbew.",   price: fairValue * 2.0, action: "15% trimmen",             pct: "+100%" },
+    { level: "Zyklusreife",            price: fairValue * 3.0, action: "Weitere 15-20% trimmen",  pct: "+200%" },
+    { level: "Euphorie",              price: fairValue * 4.5, action: "Aggressive Reduktion",     pct: "+350%" },
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// HISTORICAL BTC PRICES (quarterly milestones for chart overlay)
+// ---------------------------------------------------------------------------
+
+const HISTORICAL_PRICES = [
+  // [year_fraction, price_usd]
+  [2013.0, 13], [2013.25, 90], [2013.5, 100], [2013.75, 200], [2013.85, 1150], [2013.95, 750],
+  [2014.0, 800], [2014.25, 450], [2014.5, 580], [2014.75, 380], [2014.95, 320],
+  [2015.0, 290], [2015.25, 240], [2015.5, 260], [2015.75, 230], [2015.95, 430],
+  [2016.0, 430], [2016.25, 420], [2016.5, 660], [2016.75, 610], [2016.95, 960],
+  [2017.0, 1000], [2017.25, 1080], [2017.4, 2500], [2017.5, 2600], [2017.6, 4400], [2017.75, 5600], [2017.85, 11000], [2017.95, 14000],
+  [2018.0, 13800], [2018.1, 8500], [2018.25, 7000], [2018.5, 6400], [2018.75, 6500], [2018.9, 4000], [2018.95, 3700],
+  [2019.0, 3700], [2019.25, 4100], [2019.4, 8000], [2019.5, 11500], [2019.6, 10000], [2019.75, 8300], [2019.95, 7200],
+  [2020.0, 7200], [2020.15, 8700], [2020.2, 5200], [2020.25, 6400], [2020.5, 9200], [2020.75, 10800], [2020.85, 13800], [2020.95, 29000],
+  [2021.0, 33000], [2021.1, 46000], [2021.2, 58000], [2021.25, 35000], [2021.35, 35000], [2021.5, 42000], [2021.65, 48000], [2021.75, 62000], [2021.85, 69000], [2021.9, 57000], [2021.95, 47000],
+  [2022.0, 38000], [2022.15, 42000], [2022.25, 31000], [2022.4, 29000], [2022.5, 20000], [2022.65, 23000], [2022.75, 20000], [2022.85, 20500], [2022.9, 17000], [2022.95, 16500],
+  [2023.0, 16700], [2023.1, 21000], [2023.2, 23000], [2023.25, 28000], [2023.35, 29000], [2023.5, 30000], [2023.65, 26000], [2023.75, 27000], [2023.85, 34000], [2023.95, 42000],
+  [2024.0, 44000], [2024.1, 52000], [2024.2, 71000], [2024.25, 64000], [2024.35, 66000], [2024.5, 58000], [2024.6, 65000], [2024.7, 56000], [2024.75, 63000], [2024.85, 73000], [2024.95, 94000],
+  [2025.0, 96000], [2025.15, 102000], [2025.25, 85000], [2025.35, 82000], [2025.5, 95000], [2025.6, 105000], [2025.75, 126000], [2025.85, 100000], [2025.95, 94000],
+  [2026.0, 93000], [2026.05, 73000], [2026.1, 72000], [2026.15, 70000], [2026.22, 68500],
+];
+
+// ---------------------------------------------------------------------------
+// FORMATTING
+// ---------------------------------------------------------------------------
+
+const fmt = (n) => {
+  if (n >= 1e6) return `$${(n / 1e6).toFixed(2)}M`;
+  if (n >= 1e3) return `$${(n / 1e3).toFixed(0)}k`;
+  return `$${n.toFixed(0)}`;
+};
+
+const fmtPrecise = (n) => {
+  if (n >= 1e6) return `$${(n / 1e6).toFixed(3)}M`;
+  if (n >= 1e3) return `$${(n / 1e3).toFixed(1)}k`;
+  return `$${n.toFixed(0)}`;
+};
+
+// ---------------------------------------------------------------------------
+// CHART: Power Law Bands + Historical Prices + Oscillation
+// ---------------------------------------------------------------------------
+
+function PowerLawChart({ currentPrice, currentDate, showOscillation }) {
+  const tNow = daysSinceGenesis(currentDate);
+  const startYear = 2013;
+  const endYear = 2036;
+  const POINTS = 500;
+
+  // Per-curve visibility toggles (all in one place)
+  const [layers, setLayers] = useState({
+    hist: true, median: true, floorCeil: true, simplePL: false,
+    oscMedian: true, sigmaBand: true, forecast: true,
+  });
+  const toggle = (key) => setLayers(prev => ({ ...prev, [key]: !prev[key] }));
+
+  const currentYear = currentDate.getFullYear() + (currentDate.getMonth() + currentDate.getDate() / 30) / 12;
+
+  const curves = useMemo(() => {
+    const result = { floor: [], median: [], ceiling: [], oscMedian: [], oscFloor: [], oscCeiling: [], simplePL: [], sigma1Hi: [], sigma1Lo: [] };
+    for (let i = 0; i <= POINTS; i++) {
+      const frac = i / POINTS;
+      const year = startYear + (endYear - startYear) * frac;
+      const date = new Date(new Date(startYear, 0, 1).getTime() + (year - startYear) * 365.25 * MS_PER_DAY);
+      const t = daysSinceGenesis(date);
+      if (t > 100) {
+        const pt = { year, t };
+        const oscVal = oscillationValue(t);
+        const oscMul = Math.exp(oscVal);
+        const oscMedianPrice = powerLawPrice(t, MODELS.median) * oscMul;
+        result.floor.push({ ...pt, price: powerLawPrice(t, MODELS.floor) });
+        result.median.push({ ...pt, price: powerLawPrice(t, MODELS.median) });
+        result.ceiling.push({ ...pt, price: powerLawPrice(t, MODELS.ceiling) });
+        result.oscMedian.push({ ...pt, price: oscMedianPrice });
+        result.oscFloor.push({ ...pt, price: powerLawPrice(t, MODELS.floor) * oscMul });
+        result.oscCeiling.push({ ...pt, price: powerLawPrice(t, MODELS.ceiling) * oscMul });
+        result.simplePL.push({ ...pt, price: powerLawPrice(t, SIMPLE_PL) });
+        // ±1σ prediction band centered on osc-adjusted median
+        result.sigma1Hi.push({ ...pt, price: oscMedianPrice * Math.exp(MODEL_SIGMA) });
+        result.sigma1Lo.push({ ...pt, price: oscMedianPrice * Math.exp(-MODEL_SIGMA) });
+      }
+    }
+    return result;
+  }, []);
+
+  const W = 720, H = 380, PAD = { top: 20, right: 55, bottom: 35, left: 62 };
+  const plotW = W - PAD.left - PAD.right;
+  const plotH = H - PAD.top - PAD.bottom;
+
+  const minPrice = 10;
+  const maxPrice = 10000000;
+  const logMin = Math.log10(minPrice);
+  const logMax = Math.log10(maxPrice);
+
+  const xScale = (year) => PAD.left + ((year - startYear) / (endYear - startYear)) * plotW;
+  const yScale = (price) => {
+    const logP = Math.log10(Math.max(price, minPrice));
+    return PAD.top + plotH - ((logP - logMin) / (logMax - logMin)) * plotH;
+  };
+
+  const curvePath = (data) => data
+    .filter(d => d.price > 0 && isFinite(d.price))
+    .map((d, i) => `${i === 0 ? 'M' : 'L'}${xScale(d.year).toFixed(1)},${yScale(d.price).toFixed(1)}`)
+    .join(' ');
+
+  // Only future portion of a curve (from currentYear onward)
+  const futureOnly = (data) => data.filter(d => d.year >= currentYear && d.price > 0 && isFinite(d.price));
+
+  const cx = xScale(currentYear);
+  const cy = yScale(currentPrice);
+
+  const gridYears = [2014, 2016, 2018, 2020, 2022, 2024, 2026, 2028, 2030, 2032, 2034];
+  const gridPrices = [100, 1000, 10000, 100000, 1000000];
+
+  const zone = getZone(currentPrice, powerLawPrice(tNow, MODELS.median));
+
+  // Band fill (floor to ceiling)
+  const floorPts = curves.floor.filter(d => d.price > 0);
+  const ceilPts = curves.ceiling.filter(d => d.price > 0);
+  const bandPath = floorPts.map((d, i) => `${i === 0 ? 'M' : 'L'}${xScale(d.year).toFixed(1)},${yScale(d.price).toFixed(1)}`).join(' ')
+    + [...ceilPts].reverse().map(d => `L${xScale(d.year).toFixed(1)},${yScale(d.price).toFixed(1)}`).join('') + 'Z';
+
+  // Forecast band (osc-adjusted floor to osc-adjusted ceiling, future only)
+  const futFloor = futureOnly(curves.oscFloor);
+  const futCeil = futureOnly(curves.oscCeiling);
+  let forecastBandPath = '';
+  if (showOscillation && futFloor.length > 1 && futCeil.length > 1) {
+    forecastBandPath = futFloor.map((d, i) => `${i === 0 ? 'M' : 'L'}${xScale(d.year).toFixed(1)},${yScale(d.price).toFixed(1)}`).join(' ')
+      + [...futCeil].reverse().map(d => `L${xScale(d.year).toFixed(1)},${yScale(d.price).toFixed(1)}`).join('') + 'Z';
+  }
+
+  // Historical prices path
+  const histPath = HISTORICAL_PRICES
+    .filter(([y]) => y >= startYear && y <= endYear)
+    .map(([y, p], i) => `${i === 0 ? 'M' : 'L'}${xScale(y).toFixed(1)},${yScale(p).toFixed(1)}`)
+    .join(' ');
+
+  // Band labels at right edge (at endYear)
+  const tEnd = daysSinceGenesis(new Date(endYear, 0, 1));
+  const labelData = [
+    { price: powerLawPrice(tEnd, MODELS.ceiling), color: "#ef4444", label: "Ceiling" },
+    { price: powerLawPrice(tEnd, MODELS.median), color: "#f59e0b", label: "Median" },
+    { price: powerLawPrice(tEnd, MODELS.floor), color: "#22c55e", label: "Floor" },
+  ];
+
+  // Band labels at current date (right side of "now" line)
+  const nowLabels = [
+    { price: powerLawPrice(tNow, MODELS.ceiling), color: "#ef4444" },
+    { price: powerLawPrice(tNow, MODELS.median), color: "#f59e0b" },
+    { price: powerLawPrice(tNow, MODELS.floor), color: "#22c55e" },
+  ];
+
+  // Short format for labels
+  const fmtShort = (n) => {
+    if (n >= 1e6) return `${(n/1e6).toFixed(1)}M`;
+    if (n >= 1e3) return `${(n/1e3).toFixed(0)}k`;
+    return `${n.toFixed(0)}`;
+  };
+
+  return (
+    <>
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxWidth: 720 }}>
+      <rect width={W} height={H} fill="#0f172a" rx="8" />
+
+      {/* Grid */}
+      {gridYears.map(y => (
+        <g key={y}>
+          <line x1={xScale(y)} y1={PAD.top} x2={xScale(y)} y2={PAD.top + plotH} stroke="#1e293b" strokeWidth="0.5" />
+          <text x={xScale(y)} y={H - 8} fill="#64748b" fontSize="9" textAnchor="middle">{y}</text>
+        </g>
+      ))}
+      {gridPrices.map(p => (
+        <g key={p}>
+          <line x1={PAD.left} y1={yScale(p)} x2={PAD.left + plotW} y2={yScale(p)} stroke="#1e293b" strokeWidth="0.5" />
+          <text x={PAD.left - 5} y={yScale(p) + 3} fill="#64748b" fontSize="8" textAnchor="end">
+            {p >= 1e6 ? `$${p/1e6}M` : p >= 1e3 ? `$${p/1e3}k` : `$${p}`}
+          </text>
+        </g>
+      ))}
+
+      {/* Band fill (floor–ceiling) */}
+      {layers.floorCeil && <path d={bandPath} fill="#1e3a2a" opacity="0.2" />}
+
+      {/* Forecast band (osc-adjusted floor–ceiling, future only) */}
+      {showOscillation && layers.forecast && forecastBandPath && (
+        <path d={forecastBandPath} fill="#7c3aed" opacity="0.25" />
+      )}
+
+      {/* ±1σ prediction band around osc-adjusted median */}
+      {showOscillation && layers.sigmaBand && (() => {
+        const hiPts = curves.sigma1Hi.filter(d => d.price > 0 && isFinite(d.price));
+        const loPts = curves.sigma1Lo.filter(d => d.price > 0 && isFinite(d.price));
+        if (hiPts.length < 2 || loPts.length < 2) return null;
+        const sigmaPath = loPts.map((d, i) => `${i === 0 ? 'M' : 'L'}${xScale(d.year).toFixed(1)},${yScale(d.price).toFixed(1)}`).join(' ')
+          + [...hiPts].reverse().map(d => `L${xScale(d.year).toFixed(1)},${yScale(d.price).toFixed(1)}`).join('') + 'Z';
+        return <path d={sigmaPath} fill="#06b6d4" opacity="0.10" />;
+      })()}
+
+      {/* Model curves */}
+      {layers.floorCeil && <>
+        <path d={curvePath(curves.floor)} fill="none" stroke="#22c55e" strokeWidth="1.2" opacity="0.5" strokeDasharray="4,3" />
+        <path d={curvePath(curves.ceiling)} fill="none" stroke="#ef4444" strokeWidth="1.2" opacity="0.5" strokeDasharray="4,3" />
+      </>}
+      {layers.median && <path d={curvePath(curves.median)} fill="none" stroke="#f59e0b" strokeWidth="2" />}
+
+      {/* Comparison: Simple Power Law (no decay) */}
+      {layers.simplePL && (
+        <path d={curvePath(curves.simplePL)} fill="none" stroke="#64748b" strokeWidth="1.5" strokeDasharray="6,4" opacity="0.7" />
+      )}
+
+      {/* Log-periodic oscillation on median */}
+      {showOscillation && layers.oscMedian && (
+        <path d={curvePath(curves.oscMedian)} fill="none" stroke="#c084fc" strokeWidth="1.5" opacity="0.8" />
+      )}
+
+      {/* Osc-adjusted floor and ceiling (future only, dashed) */}
+      {showOscillation && layers.forecast && (
+        <>
+          <path d={curvePath(futureOnly(curves.oscFloor))} fill="none" stroke="#a78bfa" strokeWidth="1.2" opacity="0.6" strokeDasharray="3,4" />
+          <path d={curvePath(futureOnly(curves.oscCeiling))} fill="none" stroke="#a78bfa" strokeWidth="1.2" opacity="0.6" strokeDasharray="3,4" />
+        </>
+      )}
+
+      {/* Historical BTC price */}
+      {layers.hist && <path d={histPath} fill="none" stroke="#94a3b8" strokeWidth="1.2" opacity="0.7" />}
+
+      {/* "Now" divider */}
+      <line x1={cx} y1={PAD.top} x2={cx} y2={PAD.top + plotH} stroke="#f59e0b" strokeWidth="1" strokeDasharray="4,4" opacity="0.5" />
+      <rect x={cx - 18} y={PAD.top - 1} width="36" height="12" fill="#422006" rx="3" />
+      <text x={cx} y={PAD.top + 8} fill="#f59e0b" fontSize="7" textAnchor="middle" fontWeight="bold">HEUTE</text>
+
+      {/* Current position marker */}
+      <circle cx={cx} cy={cy} r="5" fill={zone.color} stroke="#fff" strokeWidth="1.5" />
+      <text x={cx - 8} y={cy - 10} fill={zone.color} fontSize="9" fontWeight="bold" textAnchor="end">
+        ${(currentPrice / 1000).toFixed(0)}k
+      </text>
+
+      {/* Future cycle markers (peak/trough) */}
+      {showOscillation && (() => {
+        const markers = [];
+        const futCurve = curves.oscMedian.filter(d => d.year > currentYear);
+        for (let i = 1; i < futCurve.length - 1; i++) {
+          const prev = futCurve[i-1], curr = futCurve[i], next = futCurve[i+1];
+          const oscPrev = oscillationValue(prev.t);
+          const oscCurr = oscillationValue(curr.t);
+          const oscNext = oscillationValue(next.t);
+          // Peak: oscillation local max, positive
+          if (oscCurr > oscPrev && oscCurr > oscNext && oscCurr > 0.05) {
+            if (!markers.length || curr.year - markers[markers.length-1].year > 1.5) {
+              markers.push({ year: curr.year, price: curr.price, type: 'peak' });
+            }
+          }
+          // Trough: oscillation local min, negative
+          if (oscCurr < oscPrev && oscCurr < oscNext && oscCurr < -0.02) {
+            if (!markers.length || curr.year - markers[markers.length-1].year > 1.5) {
+              markers.push({ year: curr.year, price: curr.price, type: 'trough' });
+            }
+          }
+        }
+        return markers.map((m, i) => {
+          const x = xScale(m.year);
+          const xLo = xScale(m.year - 0.25);
+          const xHi = xScale(m.year + 0.25);
+          const y = yScale(m.price);
+          const isPeak = m.type === 'peak';
+          const color = isPeak ? '#22c55e' : '#ef4444';
+          const yr = Math.floor(m.year);
+          const mo = Math.floor((m.year % 1) * 12) + 1;
+          const priceLabel = m.price >= 1e6 ? `$${(m.price/1e6).toFixed(1)}M` : `$${(m.price/1e3).toFixed(0)}k`;
+          const labelY = isPeak ? y - 26 : y + 6;
+          const loDate = new Date(yr, mo - 4, 1);
+          const hiDate = new Date(yr, mo + 2, 1);
+          return (
+            <g key={`cyc-${i}`}>
+              <rect x={xLo} y={PAD.top} width={xHi - xLo} height={plotH}
+                fill={color} opacity="0.06" />
+              <line x1={x} y1={PAD.top} x2={x} y2={PAD.top + plotH}
+                stroke={color} strokeWidth="1" strokeDasharray="4,4" opacity="0.4" />
+              <circle cx={x} cy={y} r="4" fill={color} opacity="0.7" />
+              <rect x={x - 30} y={labelY} width="60" height="22" fill="#0f172a" opacity="0.85" rx="3" />
+              <text x={x} y={labelY + 10} fill={color} fontSize="7" textAnchor="middle" fontWeight="bold">
+                {loDate.getMonth()+1}/{loDate.getFullYear()}–{hiDate.getMonth()+1}/{hiDate.getFullYear()}
+              </text>
+              <text x={x} y={labelY + 19} fill={color} fontSize="7" textAnchor="middle" opacity="0.8">
+                ~{priceLabel}
+              </text>
+            </g>
+          );
+        });
+      })()}
+
+      {/* Band labels at right edge */}
+      {labelData.map((d, i) => {
+        const y = yScale(d.price);
+        return (
+          <g key={i}>
+            <line x1={PAD.left + plotW} y1={y} x2={PAD.left + plotW + 3} y2={y} stroke={d.color} strokeWidth="1" opacity="0.5" />
+            <text x={W - PAD.right + 6} y={y + 3} fill={d.color} fontSize="7.5" fontWeight="bold">
+              ${fmtShort(d.price)}
+            </text>
+          </g>
+        );
+      })}
+
+      {/* Legend - rendered as interactive HTML below */}
+    </svg>
+    <div className="flex flex-wrap gap-x-3 gap-y-1 mt-2 px-1">
+      {[
+        { key: 'hist', color: '#94a3b8', label: 'BTC Preis', line: true },
+        { key: 'median', color: '#f59e0b', label: 'Median (Decay)', line: true },
+        { key: 'floorCeil', color: '#22c55e', label: 'Floor / Ceiling', line: true, dashed: true },
+        { key: 'simplePL', color: '#64748b', label: 'Einfaches PL (Vgl.)', line: true, dashed: true },
+        ...(showOscillation ? [
+          { key: 'oscMedian', color: '#c084fc', label: 'Osc. Median', line: true },
+          { key: 'sigmaBand', color: '#06b6d4', label: '±1σ Band', band: true },
+          { key: 'forecast', color: '#a78bfa', label: 'Forecast-Band', band: true },
+        ] : []),
+      ].map(item => {
+        const active = layers[item.key];
+        return (
+          <button key={item.key} onClick={() => toggle(item.key)}
+            className="flex items-center gap-1 text-xs py-0.5 px-1.5 rounded transition-opacity"
+            style={{ opacity: active ? 1 : 0.35 }}>
+            {item.line ? (
+              <svg width="14" height="8" viewBox="0 0 14 8">
+                <line x1="0" y1="4" x2="14" y2="4" stroke={item.color}
+                  strokeWidth={item.key === 'median' ? 2 : 1.2}
+                  strokeDasharray={item.dashed ? '4,3' : 'none'} />
+              </svg>
+            ) : (
+              <svg width="14" height="8" viewBox="0 0 14 8">
+                <rect width="14" height="8" fill={item.color} opacity="0.4" rx="1" />
+              </svg>
+            )}
+            <span style={{ color: item.color }}>{item.label}</span>
+          </button>
+        );
+      })}
+    </div>
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// CHART: Oscillation Residual (Cycle Position)
+// ---------------------------------------------------------------------------
+
+function OscillationChart({ currentDate }) {
+  const tNow = daysSinceGenesis(currentDate);
+  const startYear = 2013;
+  const endYear = 2036;
+  const POINTS = 500;
+
+  const data = useMemo(() => {
+    const result = [];
+    for (let i = 0; i <= POINTS; i++) {
+      const frac = i / POINTS;
+      const year = startYear + (endYear - startYear) * frac;
+      const date = new Date(new Date(startYear, 0, 1).getTime() + (year - startYear) * 365.25 * MS_PER_DAY);
+      const t = daysSinceGenesis(date);
+      if (t > 100) {
+        result.push({ year, t, osc: oscillationValue(t) });
+      }
+    }
+    return result;
+  }, []);
+
+  // Historical residuals: actual price vs power law median
+  const histResiduals = useMemo(() => {
+    return HISTORICAL_PRICES
+      .filter(([y]) => y >= startYear && y <= endYear)
+      .map(([y, p]) => {
+        const date = new Date(new Date(startYear, 0, 1).getTime() + (y - startYear) * 365.25 * MS_PER_DAY);
+        const t = daysSinceGenesis(date);
+        if (t > 100) {
+          const fairVal = powerLawPrice(t, MODELS.median);
+          return { year: y, residual: Math.log(p / fairVal) };
+        }
+        return null;
+      })
+      .filter(Boolean);
+  }, []);
+
+  const W = 720, H = 200, PAD = { top: 15, right: 25, bottom: 30, left: 62 };
+  const plotW = W - PAD.left - PAD.right;
+  const plotH = H - PAD.top - PAD.bottom;
+
+  const yMin = -2.5, yMax = 2.5;
+  const xScale = (year) => PAD.left + ((year - startYear) / (endYear - startYear)) * plotW;
+  const yScale = (val) => PAD.top + plotH / 2 - (val / (yMax - yMin)) * plotH;
+
+  const oscPath = data.map((d, i) =>
+    `${i === 0 ? 'M' : 'L'}${xScale(d.year).toFixed(1)},${yScale(d.osc).toFixed(1)}`
+  ).join(' ');
+
+  // Fill areas above/below zero
+  const oscAbovePath = data.map((d, i) => {
+    const y = Math.min(d.osc, 0);
+    return `${i === 0 ? 'M' : 'L'}${xScale(d.year).toFixed(1)},${yScale(Math.max(d.osc, 0)).toFixed(1)}`;
+  }).join(' ') + ` L${xScale(data[data.length-1].year).toFixed(1)},${yScale(0).toFixed(1)} L${xScale(data[0].year).toFixed(1)},${yScale(0).toFixed(1)} Z`;
+
+  const currentYear = currentDate.getFullYear() + (currentDate.getMonth() + currentDate.getDate() / 30) / 12;
+  const currentOsc = oscillationValue(tNow);
+
+  const gridYears = [2014, 2016, 2018, 2020, 2022, 2024, 2026, 2028, 2030, 2032, 2034];
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxWidth: 720 }}>
+      <rect width={W} height={H} fill="#0f172a" rx="8" />
+
+      {/* Grid */}
+      {gridYears.map(y => (
+        <g key={y}>
+          <line x1={xScale(y)} y1={PAD.top} x2={xScale(y)} y2={PAD.top + plotH} stroke="#1e293b" strokeWidth="0.5" />
+          <text x={xScale(y)} y={H - 5} fill="#64748b" fontSize="9" textAnchor="middle">{y}</text>
+        </g>
+      ))}
+
+      {/* Zero line */}
+      <line x1={PAD.left} y1={yScale(0)} x2={PAD.left + plotW} y2={yScale(0)} stroke="#475569" strokeWidth="1" />
+
+      {/* Y-axis labels */}
+      {[-2.0, -1.5, -1.0, -0.5, 0, 0.5, 1.0, 1.5, 2.0].map(v => (
+        <text key={v} x={PAD.left - 5} y={yScale(v) + 3} fill="#64748b" fontSize="8" textAnchor="end">
+          {v > 0 ? `+${v}` : v}
+        </text>
+      ))}
+
+      {/* Zone fill */}
+      <rect x={PAD.left} y={yScale(2.5)} width={plotW} height={yScale(0) - yScale(2.5)} fill="#22c55e" opacity="0.06" />
+      <rect x={PAD.left} y={yScale(0)} width={plotW} height={yScale(-2.5) - yScale(0)} fill="#ef4444" opacity="0.06" />
+
+      {/* Zone labels */}
+      <text x={PAD.left + 4} y={yScale(2.0)} fill="#22c55e" fontSize="8" opacity="0.5">Überbewertung</text>
+      <text x={PAD.left + 4} y={yScale(-1.8)} fill="#ef4444" fontSize="8" opacity="0.5">Unterbewertung</text>
+
+      {/* Historical residuals as dots */}
+      {histResiduals.map((d, i) => (
+        <circle key={i} cx={xScale(d.year)} cy={yScale(d.residual)} r="2"
+          fill={d.residual > 0 ? "#86efac" : "#fca5a5"} opacity="0.6" />
+      ))}
+
+      {/* Oscillation model curve */}
+      <path d={oscPath} fill="none" stroke="#c084fc" strokeWidth="2" />
+
+      {/* Future peak/trough markers */}
+      {(() => {
+        const markers = [];
+        const futureData = data.filter(d => d.year > currentYear);
+        // Find all future peaks and troughs
+        for (let i = 1; i < futureData.length - 1; i++) {
+          const prev = futureData[i-1], curr = futureData[i], next = futureData[i+1];
+          if (curr.osc > prev.osc && curr.osc > next.osc && curr.osc > 0.05) {
+            // Check not too close to last marker
+            if (!markers.length || curr.year - markers[markers.length-1].year > 1.5) {
+              markers.push({ year: curr.year, osc: curr.osc, type: 'peak' });
+            }
+          }
+          if (curr.osc < prev.osc && curr.osc < next.osc && curr.osc < -0.02) {
+            if (!markers.length || curr.year - markers[markers.length-1].year > 1.5) {
+              markers.push({ year: curr.year, osc: curr.osc, type: 'trough' });
+            }
+          }
+        }
+        return markers.map((m, i) => {
+          const x = xScale(m.year);
+          const xLo = xScale(m.year - 0.25); // ±3 months
+          const xHi = xScale(m.year + 0.25);
+          const isPeak = m.type === 'peak';
+          const color = isPeak ? '#22c55e' : '#ef4444';
+          const label = isPeak ? 'Peak-Fenster' : 'Trough-Fenster';
+          const yr = Math.floor(m.year);
+          const mo = Math.floor((m.year % 1) * 12) + 1;
+          const tAtMarker = daysSinceGenesis(new Date(yr, mo - 1, 1));
+          const impliedPrice = powerLawPrice(tAtMarker, MODELS.median) * Math.exp(m.osc);
+          const priceLabel = impliedPrice >= 1e6 ? `$${(impliedPrice/1e6).toFixed(1)}M` : `$${(impliedPrice/1e3).toFixed(0)}k`;
+          const labelY = isPeak ? PAD.top + 1 : PAD.top + plotH - 25;
+          // Window dates
+          const loDate = new Date(yr, mo - 4, 1);
+          const hiDate = new Date(yr, mo + 2, 1);
+          const loLabel = `${loDate.getMonth()+1}/${loDate.getFullYear()}`;
+          const hiLabel = `${hiDate.getMonth()+1}/${hiDate.getFullYear()}`;
+          return (
+            <g key={i}>
+              {/* ±3 month window band */}
+              <rect x={xLo} y={PAD.top} width={xHi - xLo} height={plotH}
+                fill={color} opacity="0.08" />
+              {/* Center line */}
+              <line x1={x} y1={PAD.top} x2={x} y2={PAD.top + plotH}
+                stroke={color} strokeWidth="1" strokeDasharray="4,4" opacity="0.5" />
+              {/* Label */}
+              <rect x={x - 32} y={labelY} width="64" height="24" fill="#0f172a" opacity="0.85" rx="3" />
+              <text x={x} y={labelY + 10} fill={color} fontSize="7" textAnchor="middle" fontWeight="bold">
+                {label} {loLabel}–{hiLabel}
+              </text>
+              <text x={x} y={labelY + 20} fill={color} fontSize="7" textAnchor="middle" opacity="0.7">
+                ~{priceLabel} (MAE ±3M)
+              </text>
+            </g>
+          );
+        });
+      })()}
+
+      {/* Current position */}
+      <line x1={xScale(currentYear)} y1={PAD.top} x2={xScale(currentYear)} y2={PAD.top + plotH}
+        stroke="#fbbf24" strokeWidth="1" strokeDasharray="3,3" opacity="0.7" />
+      <circle cx={xScale(currentYear)} cy={yScale(currentOsc)} r="5"
+        fill="#c084fc" stroke="#fff" strokeWidth="1.5" />
+      <text x={xScale(currentYear) + 8} y={yScale(currentOsc) - 6}
+        fill="#c084fc" fontSize="9" fontWeight="bold">
+        {currentOsc > 0 ? '+' : ''}{currentOsc.toFixed(2)}
+      </text>
+    </svg>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// GAUGE COMPONENT
+// ---------------------------------------------------------------------------
+
+function ValueGauge({ ratio }) {
+  const clampedRatio = Math.max(0.3, Math.min(4.0, ratio));
+  const pct = ((clampedRatio - 0.3) / (4.0 - 0.3)) * 100;
+
+  return (
+    <div className="relative w-full h-6 rounded-full overflow-hidden" style={{
+      background: 'linear-gradient(to right, #16a34a, #22c55e, #86efac, #fbbf24, #f97316, #ef4444, #991b1b)'
+    }}>
+      <div className="absolute top-0 h-full w-0.5 bg-white" style={{
+        left: `${pct}%`, boxShadow: '0 0 6px rgba(255,255,255,0.8)'
+      }}>
+        <div className="absolute -top-5 left-1/2 -translate-x-1/2 text-white text-xs font-bold bg-slate-800 px-1.5 py-0.5 rounded whitespace-nowrap">
+          {(ratio * 100).toFixed(0)}%
+        </div>
+      </div>
+      <div className="absolute inset-0 flex items-center justify-between px-2 text-xs font-medium text-white/70"
+        style={{ textShadow: '0 1px 2px rgba(0,0,0,0.5)' }}>
+        <span>Deep Value</span>
+        <span>Fair</span>
+        <span>Euphorie</span>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// CYCLE PHASE INDICATOR
+// ---------------------------------------------------------------------------
+
+function CyclePhaseIndicator({ tNow, btcPrice, fairValue }) {
+  const osc = oscillationValue(tNow);
+
+  // Compute derivative (finite difference)
+  const dt = 1; // 1 day
+  const oscNext = oscillationValue(tNow + dt);
+  const derivative = oscNext - osc;
+
+  // Phase classification — thresholds for full fit amplitudes (range ≈ ±1.2)
+  let phase, phaseColor, phaseIcon;
+  if (osc > 0.5 && derivative < 0) {
+    phase = "Peak-Rollover"; phaseColor = "#ef4444"; phaseIcon = "↘";
+  } else if (osc > 0.25 && derivative > 0) {
+    phase = "Anstieg (spät)"; phaseColor = "#f97316"; phaseIcon = "↗";
+  } else if (osc > 0 && derivative > 0) {
+    phase = "Anstieg (früh)"; phaseColor = "#22c55e"; phaseIcon = "↗";
+  } else if (osc < -0.5 && derivative > 0) {
+    phase = "Trough-Erholung"; phaseColor = "#22c55e"; phaseIcon = "↗";
+  } else if (osc < -0.25 && derivative < 0) {
+    phase = "Korrektur (spät)"; phaseColor = "#dc2626"; phaseIcon = "↘";
+  } else if (osc < 0 && derivative < 0) {
+    phase = "Korrektur (früh)"; phaseColor = "#f97316"; phaseIcon = "↘";
+  } else if (derivative > 0) {
+    phase = "Neutral/Ansteigend"; phaseColor = "#86efac"; phaseIcon = "→";
+  } else {
+    phase = "Neutral/Fallend"; phaseColor = "#fbbf24"; phaseIcon = "→";
+  }
+
+  // Find next peak and trough (local extrema in the oscillation)
+  let nextPeakT = null, nextTroughT = null;
+  let prevOsc = oscillationValue(tNow);
+  let wasDecreasing = false, wasIncreasing = false;
+  for (let dt2 = 1; dt2 < 5475; dt2 += 1) {  // scan 15 years
+    const t = tNow + dt2;
+    const currOsc = oscillationValue(t);
+    
+    // Peak: was increasing, now decreasing, and value is positive
+    if (!nextPeakT && wasIncreasing && currOsc < prevOsc && prevOsc > 0.15) {
+      nextPeakT = dt2 - 1;
+    }
+    // Trough: was decreasing, now increasing, and value is negative or near zero
+    if (!nextTroughT && wasDecreasing && currOsc > prevOsc && prevOsc < 0) {
+      nextTroughT = dt2 - 1;
+    }
+    
+    wasIncreasing = currOsc > prevOsc;
+    wasDecreasing = currOsc < prevOsc;
+    prevOsc = currOsc;
+    if (nextPeakT && nextTroughT) break;
+  }
+
+  const peakDate = nextPeakT ? new Date(Date.now() + nextPeakT * MS_PER_DAY) : null;
+  const troughDate = nextTroughT ? new Date(Date.now() + nextTroughT * MS_PER_DAY) : null;
+  const fmtDate = (d) => d ? `${d.getMonth()+1}/${d.getFullYear()}` : "—";
+
+  // Actual deviation from trend
+  const actualDev = Math.log(btcPrice / fairValue);
+  const divergence = actualDev - osc;
+
+  return (
+    <div className="space-y-2">
+      <div className="grid grid-cols-4 gap-2">
+        <div className="bg-slate-800/60 rounded-lg p-3 text-center">
+          <p className="text-xs text-slate-500 uppercase tracking-wider mb-1">Zyklusphase</p>
+          <p className="text-base font-bold" style={{ color: phaseColor }}>
+            {phaseIcon} {phase}
+          </p>
+        </div>
+        <div className="bg-slate-800/60 rounded-lg p-3 text-center">
+          <p className="text-xs text-slate-500 uppercase tracking-wider mb-1">Modell-Erwartung</p>
+          <p className="text-base font-bold font-mono" style={{ color: osc > 0 ? '#22c55e' : '#ef4444' }}>
+            {osc > 0 ? '+' : ''}{(Math.exp(osc)*100 - 100).toFixed(0)}%
+          </p>
+          <p className="text-xs text-slate-600 mt-0.5">
+            {osc > 0 ? 'über' : 'unter'} Trend (Osc {osc > 0 ? '+' : ''}{osc.toFixed(2)})
+          </p>
+        </div>
+        <div className="bg-slate-800/60 rounded-lg p-3 text-center">
+          <p className="text-xs text-slate-500 uppercase tracking-wider mb-1">Tatsächlich</p>
+          <p className="text-base font-bold font-mono" style={{ color: actualDev > 0 ? '#22c55e' : '#ef4444' }}>
+            {actualDev > 0 ? '+' : ''}{(Math.exp(actualDev)*100 - 100).toFixed(0)}%
+          </p>
+          <p className="text-xs text-slate-600 mt-0.5">
+            {actualDev > 0 ? 'über' : 'unter'} Trend (${(btcPrice/1000).toFixed(0)}k vs ${(fairValue/1000).toFixed(0)}k)
+          </p>
+        </div>
+        <div className="bg-slate-800/60 rounded-lg p-3 text-center border" style={{ borderColor: Math.abs(divergence) > 0.3 ? '#f59e0b' : '#334155' }}>
+          <p className="text-xs text-slate-500 uppercase tracking-wider mb-1">Divergenz</p>
+          <p className="text-base font-bold font-mono" style={{ color: '#f59e0b' }}>
+            {(divergence * 100).toFixed(0)}pp
+          </p>
+          <p className="text-xs text-slate-600 mt-0.5">
+            {Math.abs(divergence) > 0.5 ? 'Exogener Druck' : Math.abs(divergence) > 0.2 ? 'Moderate Abweichung' : 'Im Rahmen'}
+          </p>
+        </div>
+      </div>
+      <div className="bg-slate-800/60 rounded-lg px-3 py-2 flex justify-center gap-6 text-xs text-slate-400">
+        <span>
+          <span className="text-green-400">Nächster Peak:</span> ~{fmtDate(peakDate)}
+          {nextPeakT && <span className="text-slate-600"> ({Math.round(nextPeakT/30)}M)</span>}
+        </span>
+        <span>
+          <span className="text-red-400">Nächster Trough:</span> ~{fmtDate(troughDate)}
+          {nextTroughT && <span className="text-slate-600"> ({Math.round(nextTroughT/30)}M)</span>}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// CHART: BTC Price vs ISM PMI (Dual Axis)
+// ---------------------------------------------------------------------------
+
+function PmiOverlayChart({ btcPrice, currentDate }) {
+  // Build combined data: PMI + BTC historical prices at monthly resolution
+  const data = useMemo(() => {
+    const result = [];
+    for (const [yf, pmi] of PMI_HISTORY) {
+      // Find closest BTC price
+      let btc = null;
+      let minDist = 999;
+      for (const [by, bp] of HISTORICAL_PRICES) {
+        const dist = Math.abs(by - yf);
+        if (dist < minDist) { minDist = dist; btc = bp; }
+      }
+      if (btc && minDist < 0.15) {
+        result.push({ year: yf, pmi, btc });
+      }
+    }
+    // Add current
+    const currYear = currentDate.getFullYear() + currentDate.getMonth() / 12;
+    const latestPmi = getLatestPmi();
+    result.push({ year: currYear, pmi: latestPmi[1], btc: btcPrice });
+    return result;
+  }, [btcPrice, currentDate]);
+
+  const W = 720, H = 240, PAD = { top: 20, right: 50, bottom: 30, left: 62 };
+  const plotW = W - PAD.left - PAD.right;
+  const plotH = H - PAD.top - PAD.bottom;
+
+  const startYear = 2013, endYear = 2026.5;
+  const xScale = (y) => PAD.left + ((y - startYear) / (endYear - startYear)) * plotW;
+
+  // BTC axis (log)
+  const btcMin = 100, btcMax = 200000;
+  const logMin = Math.log10(btcMin), logMax = Math.log10(btcMax);
+  const yBtc = (p) => PAD.top + plotH - ((Math.log10(Math.max(p, btcMin)) - logMin) / (logMax - logMin)) * plotH;
+
+  // PMI axis (linear 35–65)
+  const pmiLo = 38, pmiHi = 66;
+  const yPmi = (v) => PAD.top + plotH - ((v - pmiLo) / (pmiHi - pmiLo)) * plotH;
+
+  // Paths
+  const btcPath = data.map((d, i) => `${i === 0 ? 'M' : 'L'}${xScale(d.year).toFixed(1)},${yBtc(d.btc).toFixed(1)}`).join(' ');
+
+  // PMI as colored segments (green > 50, red < 50)
+  const pmiSegments = [];
+  for (let i = 1; i < data.length; i++) {
+    const prev = data[i-1], curr = data[i];
+    const above = (prev.pmi + curr.pmi) / 2 >= 50;
+    pmiSegments.push({
+      d: `M${xScale(prev.year).toFixed(1)},${yPmi(prev.pmi).toFixed(1)} L${xScale(curr.year).toFixed(1)},${yPmi(curr.pmi).toFixed(1)}`,
+      color: above ? '#22c55e' : '#ef4444',
+    });
+  }
+
+  const gridYears = [2014, 2016, 2018, 2020, 2022, 2024, 2026];
+  const currentYear = currentDate.getFullYear() + currentDate.getMonth() / 12;
+  const latestPmi = getLatestPmi()[1];
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxWidth: 720 }}>
+      <rect width={W} height={H} fill="#0f172a" rx="8" />
+
+      {/* Grid */}
+      {gridYears.map(y => (
+        <g key={y}>
+          <line x1={xScale(y)} y1={PAD.top} x2={xScale(y)} y2={PAD.top + plotH} stroke="#1e293b" strokeWidth="0.5" />
+          <text x={xScale(y)} y={H - 5} fill="#64748b" fontSize="9" textAnchor="middle">{y}</text>
+        </g>
+      ))}
+
+      {/* PMI = 50 threshold */}
+      <line x1={PAD.left} y1={yPmi(50)} x2={PAD.left + plotW} y2={yPmi(50)} stroke="#475569" strokeWidth="1" strokeDasharray="4,4" />
+      <text x={PAD.left + plotW + 4} y={yPmi(50) + 3} fill="#64748b" fontSize="7">PMI 50</text>
+
+      {/* BTC price axis labels */}
+      {[1000, 10000, 100000].map(p => (
+        <g key={p}>
+          <line x1={PAD.left} y1={yBtc(p)} x2={PAD.left + plotW} y2={yBtc(p)} stroke="#1e293b" strokeWidth="0.5" />
+          <text x={PAD.left - 5} y={yBtc(p) + 3} fill="#64748b" fontSize="8" textAnchor="end">
+            {p >= 1e3 ? `$${p/1e3}k` : `$${p}`}
+          </text>
+        </g>
+      ))}
+
+      {/* PMI axis labels (right) */}
+      {[40, 45, 50, 55, 60, 65].map(v => (
+        <text key={v} x={PAD.left + plotW + 4} y={yPmi(v) + 3} fill={v >= 50 ? '#22c55e' : '#ef4444'} fontSize="7" opacity="0.5">
+          {v}
+        </text>
+      ))}
+
+      {/* PMI line (colored segments) */}
+      {pmiSegments.map((s, i) => (
+        <path key={i} d={s.d} fill="none" stroke={s.color} strokeWidth="2" opacity="0.7" />
+      ))}
+
+      {/* BTC price line */}
+      <path d={btcPath} fill="none" stroke="#f59e0b" strokeWidth="1.5" />
+
+      {/* Current PMI marker */}
+      <circle cx={xScale(currentYear)} cy={yPmi(latestPmi)} r="4"
+        fill={latestPmi >= 50 ? '#22c55e' : '#ef4444'} stroke="#fff" strokeWidth="1" />
+
+      {/* Legend */}
+      <g transform={`translate(${PAD.left + 5}, ${PAD.top + 5})`}>
+        <line x1="0" y1="0" x2="14" y2="0" stroke="#f59e0b" strokeWidth="1.5" />
+        <text x="18" y="3" fill="#f59e0b" fontSize="7">BTC Preis (log)</text>
+        <line x1="0" y1="10" x2="7" y2="10" stroke="#22c55e" strokeWidth="2" />
+        <line x1="7" y1="10" x2="14" y2="10" stroke="#ef4444" strokeWidth="2" />
+        <text x="18" y="13" fill="#94a3b8" fontSize="7">ISM PMI (grün {'>'}50, rot {'<'}50)</text>
+      </g>
+    </svg>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// CHART: PMI-Adjusted Fair Value
+// ---------------------------------------------------------------------------
+
+function PmiAdjustedFVChart({ btcPrice, currentDate }) {
+  const startYear = 2018, endYear = 2036;
+  const POINTS = 400;
+
+  const curves = useMemo(() => {
+    const median = [], pmiAdj = [];
+    // Use last known PMI for forward projection
+    const latestPmi = getLatestPmi()[1];
+
+    for (let i = 0; i <= POINTS; i++) {
+      const frac = i / POINTS;
+      const year = startYear + (endYear - startYear) * frac;
+      const date = new Date(new Date(startYear, 0, 1).getTime() + (year - startYear) * 365.25 * MS_PER_DAY);
+      const t = daysSinceGenesis(date);
+      if (t > 100) {
+        const medPrice = powerLawPrice(t, MODELS.median);
+        // Find PMI for this date (historical or use latest for future)
+        let pmi = latestPmi;
+        for (let j = PMI_HISTORY.length - 1; j >= 0; j--) {
+          if (PMI_HISTORY[j][0] <= year) { pmi = PMI_HISTORY[j][1]; break; }
+        }
+        median.push({ year, price: medPrice });
+        pmiAdj.push({ year, price: getPmiAdjustedFairValue(pmi, medPrice) });
+      }
+    }
+    return { median, pmiAdj };
+  }, []);
+
+  const W = 720, H = 240, PAD = { top: 20, right: 55, bottom: 30, left: 62 };
+  const plotW = W - PAD.left - PAD.right;
+  const plotH = H - PAD.top - PAD.bottom;
+
+  const minPrice = 1000, maxPrice = 5000000;
+  const logMin = Math.log10(minPrice), logMax = Math.log10(maxPrice);
+  const xScale = (y) => PAD.left + ((y - startYear) / (endYear - startYear)) * plotW;
+  const yScale = (p) => PAD.top + plotH - ((Math.log10(Math.max(p, minPrice)) - logMin) / (logMax - logMin)) * plotH;
+
+  const curvePath = (data) => data
+    .filter(d => d.price > 0 && isFinite(d.price))
+    .map((d, i) => `${i === 0 ? 'M' : 'L'}${xScale(d.year).toFixed(1)},${yScale(d.price).toFixed(1)}`)
+    .join(' ');
+
+  const currentYear = currentDate.getFullYear() + currentDate.getMonth() / 12;
+  const tNow = daysSinceGenesis(currentDate);
+  const medianNow = powerLawPrice(tNow, MODELS.median);
+  const latestPmi = getLatestPmi()[1];
+  const pmiAdjNow = getPmiAdjustedFairValue(latestPmi, medianNow);
+
+  const gridYears = [2018, 2020, 2022, 2024, 2026, 2028, 2030, 2032, 2034];
+  const gridPrices = [1000, 10000, 100000, 1000000];
+
+  const fmtShort = (n) => n >= 1e6 ? `${(n/1e6).toFixed(1)}M` : n >= 1e3 ? `${(n/1e3).toFixed(0)}k` : `${n.toFixed(0)}`;
+
+  // Historical BTC path (2018+)
+  const histPath = HISTORICAL_PRICES
+    .filter(([y]) => y >= startYear && y <= endYear)
+    .map(([y, p], i) => `${i === 0 ? 'M' : 'L'}${xScale(y).toFixed(1)},${yScale(p).toFixed(1)}`)
+    .join(' ');
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxWidth: 720 }}>
+      <rect width={W} height={H} fill="#0f172a" rx="8" />
+
+      {/* Grid */}
+      {gridYears.map(y => (
+        <g key={y}>
+          <line x1={xScale(y)} y1={PAD.top} x2={xScale(y)} y2={PAD.top + plotH} stroke="#1e293b" strokeWidth="0.5" />
+          <text x={xScale(y)} y={H - 5} fill="#64748b" fontSize="9" textAnchor="middle">{y}</text>
+        </g>
+      ))}
+      {gridPrices.map(p => (
+        <g key={p}>
+          <line x1={PAD.left} y1={yScale(p)} x2={PAD.left + plotW} y2={yScale(p)} stroke="#1e293b" strokeWidth="0.5" />
+          <text x={PAD.left - 5} y={yScale(p) + 3} fill="#64748b" fontSize="8" textAnchor="end">
+            {p >= 1e6 ? `$${p/1e6}M` : `$${p/1e3}k`}
+          </text>
+        </g>
+      ))}
+
+      {/* Historical BTC price */}
+      <path d={histPath} fill="none" stroke="#94a3b8" strokeWidth="1" opacity="0.6" />
+
+      {/* Median FV */}
+      <path d={curvePath(curves.median)} fill="none" stroke="#f59e0b" strokeWidth="2" />
+
+      {/* PMI-adjusted FV */}
+      <path d={curvePath(curves.pmiAdj)} fill="none" stroke="#06b6d4" strokeWidth="2" />
+
+      {/* Now marker */}
+      <line x1={xScale(currentYear)} y1={PAD.top} x2={xScale(currentYear)} y2={PAD.top + plotH}
+        stroke="#475569" strokeWidth="0.5" strokeDasharray="3,3" />
+
+      {/* Current BTC price point */}
+      <circle cx={xScale(currentYear)} cy={yScale(btcPrice)} r="5"
+        fill="#fff" stroke="#f59e0b" strokeWidth="1.5" />
+      <text x={xScale(currentYear) - 8} y={yScale(btcPrice) - 8}
+        fill="#fff" fontSize="8" textAnchor="end" fontWeight="bold">${fmtShort(btcPrice)}</text>
+
+      {/* Right-edge labels */}
+      <text x={W - PAD.right + 6} y={yScale(curves.median[curves.median.length-1]?.price || 100000) + 3}
+        fill="#f59e0b" fontSize="7" fontWeight="bold">${fmtShort(curves.median[curves.median.length-1]?.price || 0)}</text>
+
+      {/* PMI-adj label at current */}
+      <circle cx={xScale(currentYear)} cy={yScale(pmiAdjNow)} r="3"
+        fill="#06b6d4" stroke="#fff" strokeWidth="1" />
+      <text x={xScale(currentYear) + 8} y={yScale(pmiAdjNow) + 3}
+        fill="#06b6d4" fontSize="8" fontWeight="bold">${fmtShort(pmiAdjNow)}</text>
+
+      {/* Legend */}
+      <g transform={`translate(${PAD.left + 5}, ${PAD.top + 5})`}>
+        <line x1="0" y1="0" x2="14" y2="0" stroke="#f59e0b" strokeWidth="2" />
+        <text x="18" y="3" fill="#f59e0b" fontSize="7">Median (Decay PL)</text>
+        <line x1="0" y1="10" x2="14" y2="10" stroke="#06b6d4" strokeWidth="2" />
+        <text x="18" y="13" fill="#06b6d4" fontSize="7">PMI-adjustierter FV</text>
+        <line x1="0" y1="20" x2="14" y2="20" stroke="#94a3b8" strokeWidth="1" />
+        <text x="18" y="23" fill="#94a3b8" fontSize="7">BTC Preis (hist.)</text>
+      </g>
+    </svg>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// CHART: Gold → BTC Rotation Signal
+// ---------------------------------------------------------------------------
+
+function RotationSignalChart({ ratioHistory, goldPrice, btcPrice }) {
+  const data = useMemo(() => {
+    if (ratioHistory.length < 10) return [];
+
+    // We need individual BTC and Gold prices. Derive from ratio if needed.
+    const points = ratioHistory.map(d => {
+      let btc = d.btc, gold = d.gold;
+      if (!btc || btc === 0) {
+        // XAU mode: ratio = 1/btcInGold, so btcInGold = 1/ratio
+        // We don't have USD prices directly, estimate from current
+        btc = btcPrice; // fallback
+        gold = goldPrice;
+      }
+      if (!gold || gold === 0) {
+        gold = btc * d.ratio; // ratio = gold/btc
+      }
+      return { ts: d.ts, btc, gold, ratio: d.ratio };
+    });
+
+    // Compute 7-day rolling returns (shorter window for 90d dataset)
+    const window = 7;
+    const result = [];
+    for (let i = window; i < points.length; i++) {
+      const curr = points[i];
+      const prev = points[i - window];
+      if (prev.btc > 0 && prev.gold > 0 && curr.btc > 0 && curr.gold > 0) {
+        const btcRet = (curr.btc / prev.btc - 1) * 100;
+        const goldRet = (curr.gold / prev.gold - 1) * 100;
+        const diff = btcRet - goldRet;
+
+        // Regime classification based on which asset dominates
+        let regime;
+        if (diff >= 0 && Math.abs(btcRet) >= Math.abs(goldRet)) {
+          regime = 'risk_on';      // BTC surging — orange
+        } else if (diff >= 0 && Math.abs(goldRet) > Math.abs(btcRet)) {
+          regime = 'rotation';     // Gold dropping — green
+        } else if (diff < 0 && Math.abs(btcRet) >= Math.abs(goldRet)) {
+          regime = 'risk_off';     // BTC dropping — red
+        } else {
+          regime = 'safe_haven';   // Gold surging — yellow
+        }
+
+        result.push({ ts: curr.ts, diff, btcRet, goldRet, regime });
+      }
+    }
+    return result;
+  }, [ratioHistory, btcPrice, goldPrice]);
+
+  if (data.length < 5) {
+    return <div className="text-slate-500 text-sm text-center py-4">Warte auf Preisdaten…</div>;
+  }
+
+  const W = 720, H = 200, PAD = { top: 15, right: 25, bottom: 30, left: 50 };
+  const plotW = W - PAD.left - PAD.right;
+  const plotH = H - PAD.top - PAD.bottom;
+
+  const tsMin = data[0].ts, tsMax = data[data.length - 1].ts;
+  const diffs = data.map(d => d.diff);
+  const absMax = Math.max(Math.abs(Math.min(...diffs)), Math.abs(Math.max(...diffs)), 5);
+  const yRange = absMax * 1.2;
+
+  const xScale = (ts) => PAD.left + ((ts - tsMin) / (tsMax - tsMin)) * plotW;
+  const yScale = (v) => PAD.top + plotH / 2 - (v / yRange / 2) * plotH;
+
+  const regimeColors = {
+    risk_on: '#f97316',     // orange
+    risk_off: '#ef4444',    // red
+    rotation: '#22c55e',    // green
+    safe_haven: '#eab308',  // yellow
+  };
+
+  // Build bars
+  const barWidth = Math.max(1.5, plotW / data.length * 0.8);
+
+  // Current regime
+  const latest = data[data.length - 1];
+  const regimeLabels = {
+    risk_on: 'Risk-On',
+    risk_off: 'Risk-Off',
+    rotation: 'Rotation → BTC',
+    safe_haven: 'Safe Haven',
+  };
+
+  // Month labels
+  const months = [];
+  let lastMonth = -1;
+  for (const d of data) {
+    const dt = new Date(d.ts);
+    const m = dt.getMonth();
+    if (m !== lastMonth) {
+      months.push({ ts: d.ts, label: `${m + 1}/${dt.getFullYear()}` });
+      lastMonth = m;
+    }
+  }
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxWidth: 720 }}>
+      <rect width={W} height={H} fill="#0f172a" rx="8" />
+
+      {/* Grid */}
+      {months.map((m, i) => (
+        <g key={i}>
+          <line x1={xScale(m.ts)} y1={PAD.top} x2={xScale(m.ts)} y2={PAD.top + plotH} stroke="#1e293b" strokeWidth="0.5" />
+          <text x={xScale(m.ts)} y={H - 5} fill="#64748b" fontSize="8" textAnchor="middle">{m.label}</text>
+        </g>
+      ))}
+
+      {/* Zero line */}
+      <line x1={PAD.left} y1={yScale(0)} x2={PAD.left + plotW} y2={yScale(0)} stroke="#475569" strokeWidth="1" />
+
+      {/* Y labels */}
+      {[-20, -10, 0, 10, 20].filter(v => Math.abs(v) < yRange).map(v => (
+        <text key={v} x={PAD.left - 5} y={yScale(v) + 3} fill="#64748b" fontSize="7" textAnchor="end">
+          {v > 0 ? `+${v}%` : `${v}%`}
+        </text>
+      ))}
+
+      {/* Zone labels */}
+      <text x={PAD.left + 4} y={yScale(yRange * 0.35)} fill="#f97316" fontSize="7" opacity="0.4">BTC outperformt</text>
+      <text x={PAD.left + 4} y={yScale(-yRange * 0.35)} fill="#ef4444" fontSize="7" opacity="0.4">Gold outperformt</text>
+
+      {/* Bars */}
+      {data.map((d, i) => {
+        const x = xScale(d.ts) - barWidth / 2;
+        const color = regimeColors[d.regime];
+        const y0 = yScale(0);
+        const y1 = yScale(d.diff);
+        const yTop = Math.min(y0, y1);
+        const h = Math.abs(y0 - y1);
+        return (
+          <rect key={i} x={x} y={yTop} width={barWidth} height={Math.max(h, 0.5)}
+            fill={color} opacity="0.75" rx="0.5" />
+        );
+      })}
+
+      {/* Current regime indicator */}
+      <rect x={W - PAD.right - 90} y={PAD.top + 2} width="88" height="16" fill="#0f172a" opacity="0.9" rx="3" stroke={regimeColors[latest.regime]} strokeWidth="1" />
+      <circle cx={W - PAD.right - 80} cy={PAD.top + 10} r="3" fill={regimeColors[latest.regime]} />
+      <text x={W - PAD.right - 73} y={PAD.top + 13} fill={regimeColors[latest.regime]} fontSize="8" fontWeight="bold">
+        {regimeLabels[latest.regime]}
+      </text>
+
+      {/* Legend */}
+      <g transform={`translate(${PAD.left + 5}, ${PAD.top + 3})`}>
+        <rect x="-2" y="-2" width="8" height="8" fill="#f97316" rx="1" />
+        <text x="10" y="5" fill="#f97316" fontSize="6.5">Risk-On</text>
+        <rect x="48" y="-2" width="8" height="8" fill="#22c55e" rx="1" />
+        <text x="60" y="5" fill="#22c55e" fontSize="6.5">Rotation</text>
+        <rect x="-2" y="10" width="8" height="8" fill="#ef4444" rx="1" />
+        <text x="10" y="17" fill="#ef4444" fontSize="6.5">Risk-Off</text>
+        <rect x="48" y="10" width="8" height="8" fill="#eab308" rx="1" />
+        <text x="60" y="17" fill="#eab308" fontSize="6.5">Safe Haven</text>
+      </g>
+    </svg>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// CHART: Gold/BTC Ratio
+// ---------------------------------------------------------------------------
+
+function GoldBtcRatioChart({ ratioHistory, currentRatio, goldPrice, btcPrice }) {
+  if (!ratioHistory.length) {
+    return (
+      <div className="text-slate-500 text-sm text-center py-6 space-y-1">
+        <p>Lade Ratio-Daten von CoinGecko…</p>
+        <p className="text-xs text-slate-600">(Kann 5–10 Sekunden dauern)</p>
+      </div>
+    );
+  }
+
+  const W = 720, H = 220, PAD = { top: 20, right: 55, bottom: 30, left: 62 };
+  const plotW = W - PAD.left - PAD.right;
+  const plotH = H - PAD.top - PAD.bottom;
+
+  const tsMin = ratioHistory[0].ts;
+  const tsMax = ratioHistory[ratioHistory.length - 1].ts;
+  const ratios = ratioHistory.map(d => d.ratio);
+  const rMin = Math.min(...ratios) * 0.9;
+  const rMax = Math.max(...ratios) * 1.1;
+
+  const xScale = (ts) => PAD.left + ((ts - tsMin) / (tsMax - tsMin)) * plotW;
+  const yScale = (r) => PAD.top + plotH - ((r - rMin) / (rMax - rMin)) * plotH;
+
+  const path = ratioHistory
+    .map((d, i) => `${i === 0 ? 'M' : 'L'}${xScale(d.ts).toFixed(1)},${yScale(d.ratio).toFixed(1)}`)
+    .join(' ');
+
+  // 14-day moving average
+  const maWindow = 14;
+  const maData = ratioHistory.map((d, i) => {
+    if (i < maWindow) return null;
+    const slice = ratioHistory.slice(i - maWindow, i);
+    const avg = slice.reduce((s, x) => s + x.ratio, 0) / maWindow;
+    return { ts: d.ts, ratio: avg };
+  }).filter(Boolean);
+
+  const maPath = maData
+    .map((d, i) => `${i === 0 ? 'M' : 'L'}${xScale(d.ts).toFixed(1)},${yScale(d.ratio).toFixed(1)}`)
+    .join(' ');
+
+  // Grid: monthly labels
+  const months = [];
+  for (let i = 0; i < ratioHistory.length; i += Math.floor(ratioHistory.length / 6)) {
+    const d = new Date(ratioHistory[i].ts);
+    months.push({ ts: ratioHistory[i].ts, label: `${d.getMonth()+1}/${d.getFullYear()}` });
+  }
+
+  // Y grid values
+  const step = (rMax - rMin) / 4;
+  const yTicks = Array.from({ length: 5 }, (_, i) => rMin + step * i);
+
+  // Current value marker
+  const cxNow = PAD.left + plotW; // right edge = now
+  const cyNow = yScale(currentRatio);
+
+  // Trend: 365d ago vs now
+  const ratioStart = ratioHistory[0].ratio;
+  const trendPct = ((currentRatio / ratioStart) - 1) * 100;
+  const trendDown = trendPct < 0; // falling ratio = BTC outperforming gold
+
+  // Min/Max in period
+  const minR = Math.min(...ratios);
+  const maxR = Math.max(...ratios);
+  const minIdx = ratios.indexOf(minR);
+  const maxIdx = ratios.indexOf(maxR);
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxWidth: 720 }}>
+      <rect width={W} height={H} fill="#0f172a" rx="8" />
+
+      {/* Grid */}
+      {months.map((m, i) => (
+        <g key={i}>
+          <line x1={xScale(m.ts)} y1={PAD.top} x2={xScale(m.ts)} y2={PAD.top + plotH} stroke="#1e293b" strokeWidth="0.5" />
+          <text x={xScale(m.ts)} y={H - 5} fill="#64748b" fontSize="8" textAnchor="middle">{m.label}</text>
+        </g>
+      ))}
+      {yTicks.map((v, i) => (
+        <g key={i}>
+          <line x1={PAD.left} y1={yScale(v)} x2={PAD.left + plotW} y2={yScale(v)} stroke="#1e293b" strokeWidth="0.5" />
+          <text x={PAD.left - 5} y={yScale(v) + 3} fill="#64748b" fontSize="8" textAnchor="end">
+            {v.toFixed(3)}
+          </text>
+        </g>
+      ))}
+
+      {/* Ratio line */}
+      <path d={path} fill="none" stroke="#fbbf24" strokeWidth="1.2" opacity="0.5" />
+
+      {/* 30d MA */}
+      {maPath && <path d={maPath} fill="none" stroke="#fbbf24" strokeWidth="2" />}
+
+      {/* Min marker */}
+      <circle cx={xScale(ratioHistory[minIdx].ts)} cy={yScale(minR)} r="3" fill="#22c55e" opacity="0.7" />
+      <text x={xScale(ratioHistory[minIdx].ts)} y={yScale(minR) + 12} fill="#22c55e" fontSize="7" textAnchor="middle">
+        {minR.toFixed(3)}
+      </text>
+
+      {/* Max marker */}
+      <circle cx={xScale(ratioHistory[maxIdx].ts)} cy={yScale(maxR)} r="3" fill="#ef4444" opacity="0.7" />
+      <text x={xScale(ratioHistory[maxIdx].ts)} y={yScale(maxR) - 6} fill="#ef4444" fontSize="7" textAnchor="middle">
+        {maxR.toFixed(3)}
+      </text>
+
+      {/* Current value at right edge */}
+      <circle cx={cxNow} cy={Math.max(PAD.top, Math.min(PAD.top + plotH, cyNow))} r="4" fill="#fbbf24" stroke="#fff" strokeWidth="1.5" />
+      <text x={W - PAD.right + 6} y={Math.max(PAD.top + 10, Math.min(PAD.top + plotH, cyNow)) + 3} fill="#fbbf24" fontSize="8" fontWeight="bold">
+        {currentRatio.toFixed(3)}
+      </text>
+
+      {/* Trend arrow */}
+      <text x={W - PAD.right + 6} y={PAD.top + 12} fill={trendDown ? '#22c55e' : '#ef4444'} fontSize="8" fontWeight="bold">
+        {trendDown ? '↓' : '↑'} {Math.abs(trendPct).toFixed(0)}% / 90T
+      </text>
+
+      {/* Legend */}
+      <g transform={`translate(${PAD.left + 5}, ${PAD.top + 5})`}>
+        <line x1="0" y1="0" x2="14" y2="0" stroke="#fbbf24" strokeWidth="1" opacity="0.5" />
+        <text x="18" y="3" fill="#fbbf24" fontSize="7" opacity="0.7">Gold/BTC täglich</text>
+        <line x1="0" y1="10" x2="14" y2="10" stroke="#fbbf24" strokeWidth="2" />
+        <text x="18" y="13" fill="#fbbf24" fontSize="7">14T Durchschnitt</text>
+      </g>
+    </svg>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// COLLAPSIBLE SECTION
+// ---------------------------------------------------------------------------
+
+function Section({ title, children, defaultOpen = false, borderColor = 'border-slate-800', theme }) {
+  const [open, setOpen] = useState(defaultOpen);
+  const bg = theme === 'light' ? 'bg-white' : 'bg-slate-900';
+  const hoverBg = theme === 'light' ? 'hover:bg-gray-50' : 'hover:bg-slate-800';
+  const titleColor = theme === 'light' ? 'text-gray-700' : 'text-slate-300';
+
+  return (
+    <div className={`${bg} rounded-xl border ${borderColor} overflow-hidden`}>
+      <button onClick={() => setOpen(!open)}
+        className={`w-full px-4 py-3 flex items-center justify-between ${hoverBg} transition-colors`}>
+        <h2 className={`text-sm font-semibold ${titleColor}`}>{title}</h2>
+        <span className={`text-slate-500 text-xs transition-transform ${open ? 'rotate-180' : ''}`}>▼</span>
+      </button>
+      {open && <div className="px-4 pb-4 space-y-3">{children}</div>}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// MAIN DASHBOARD
+// ---------------------------------------------------------------------------
+
+export default function BTCPowerLawMonitor() {
+  const [btcPrice, setBtcPrice] = useState(68500);
+  const [goldPrice, setGoldPrice] = useState(3050);
+  const [customDate, setCustomDate] = useState(() => new Date().toISOString().split('T')[0]);
+  const [showOscillation, setShowOscillation] = useState(true);
+  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [lastUpdate, setLastUpdate] = useState(null);
+  const [fetchStatus, setFetchStatus] = useState('idle');
+  const [ratioHistory, setRatioHistory] = useState([]);
+  const [theme, setTheme] = useState(() => {
+    if (typeof window !== 'undefined' && window.matchMedia) {
+      return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+    }
+    return 'dark';
+  });
+
+  const fetchPrice = useCallback(async () => {
+    setFetchStatus('loading');
+    try {
+      const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,tether-gold&vs_currencies=usd');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (data?.bitcoin?.usd) {
+        setBtcPrice(Math.round(data.bitcoin.usd));
+        setCustomDate(new Date().toISOString().split('T')[0]);
+        setLastUpdate(new Date());
+        setFetchStatus('ok');
+      }
+      if (data?.['tether-gold']?.usd) {
+        setGoldPrice(Math.round(data['tether-gold'].usd));
+      } else if (data?.['pax-gold']?.usd) {
+        setGoldPrice(Math.round(data['pax-gold'].usd));
+      }
+    } catch (err) {
+      console.error('Price fetch failed:', err);
+      setFetchStatus('error');
+    }
+  }, []);
+
+  // Fetch historical BTC priced in gold ounces (single API call, most reliable)
+  useEffect(() => {
+    async function fetchHistory() {
+      // Wait for initial price fetch to complete
+      await new Promise(r => setTimeout(r, 4000));
+      
+      try {
+        // BTC priced in XAU (gold ounces) — single call, no gold token needed
+        const res = await fetch('https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=90');
+        if (!res.ok) {
+          console.error('BTC history failed:', res.status);
+          return;
+        }
+        const data = await res.json();
+        
+        if (data?.prices?.length > 0) {
+          // We have BTC/USD history. For Gold/BTC ratio we need gold prices too.
+          // Use a second approach: fetch gold via simple/price and approximate
+          // the historical ratio from BTC movement + current gold price.
+          // This is approximate but functional.
+          const btcPrices = data.prices;
+          const currentGold = goldPrice || 3050;
+          
+          // Better: try to get BTC/XAU directly
+          await new Promise(r => setTimeout(r, 2000));
+          let btcInGold = null;
+          try {
+            const xauRes = await fetch('https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=xau&days=90');
+            if (xauRes.ok) {
+              const xauData = await xauRes.json();
+              if (xauData?.prices?.length > 0) {
+                btcInGold = xauData.prices;
+              }
+            }
+          } catch (e) { /* fallback below */ }
+          
+          const history = [];
+          
+          if (btcInGold) {
+            // Best case: we have BTC priced in gold ounces
+            // Gold/BTC ratio = 1 / (BTC in gold ounces)
+            for (const [ts, btcXau] of btcInGold) {
+              if (btcXau > 0) {
+                history.push({ ts, ratio: 1 / btcXau, btc: 0, gold: 0 });
+              }
+            }
+          } else {
+            // Fallback: use BTC/USD history and current gold price as constant
+            // This understates gold's movement but preserves BTC's shape
+            for (const [ts, btcP] of btcPrices) {
+              if (btcP > 0) {
+                history.push({ ts, ratio: currentGold / btcP, btc: btcP, gold: currentGold });
+              }
+            }
+          }
+          
+          if (history.length > 0) {
+            setRatioHistory(history);
+          }
+        }
+      } catch (err) {
+        console.error('History fetch failed:', err);
+      }
+    }
+    fetchHistory();
+  }, [goldPrice]);
+
+  // Fetch on mount
+  useEffect(() => { fetchPrice(); }, [fetchPrice]);
+
+  // Auto-refresh every 60 seconds
+  useEffect(() => {
+    if (!autoRefresh) return;
+    const interval = setInterval(fetchPrice, 60000);
+    return () => clearInterval(interval);
+  }, [autoRefresh, fetchPrice]);
+
+  const currentDate = new Date(customDate);
+  const tNow = daysSinceGenesis(currentDate);
+
+  const fairValue = powerLawPrice(tNow, MODELS.median);
+  const floorValue = powerLawPrice(tNow, MODELS.floor);
+  const ceilingValue = powerLawPrice(tNow, MODELS.ceiling);
+  const oscAdjustedFV = powerLawWithOscillation(tNow, MODELS.median);
+  const ratio = btcPrice / fairValue;
+  const oscRatio = btcPrice / oscAdjustedFV;
+  const zone = getZone(btcPrice, fairValue);
+  const takeProfits = getTakeProfitLevels(fairValue);
+
+  // Projections
+  const projections = [
+    { label: "6 Monate", days: 182 },
+    { label: "1 Jahr", days: 365 },
+    { label: "2 Jahre", days: 730 },
+    { label: "3 Jahre", days: 1095 },
+    { label: "5 Jahre", days: 1825 },
+    { label: "10 Jahre", days: 3650 },
+  ].map(p => {
+    const t = tNow + p.days;
+    return {
+      ...p,
+      floor: powerLawPrice(t, MODELS.floor),
+      median: powerLawPrice(t, MODELS.median),
+      ceiling: powerLawPrice(t, MODELS.ceiling),
+      oscMedian: powerLawWithOscillation(t, MODELS.median),
+    };
+  });
+
+  const isDark = theme === 'dark';
+  const bg = isDark ? 'bg-slate-950' : 'bg-gray-50';
+  const cardBg = isDark ? 'bg-slate-900' : 'bg-white';
+  const cardBorder = isDark ? 'border-slate-800' : 'border-gray-200';
+  const textPrimary = isDark ? 'text-white' : 'text-gray-900';
+  const textSecondary = isDark ? 'text-slate-400' : 'text-gray-500';
+  const textMuted = isDark ? 'text-slate-600' : 'text-gray-400';
+  const inputBg = isDark ? 'bg-slate-800 border-slate-700 text-white' : 'bg-gray-50 border-gray-300 text-gray-900';
+
+  return (
+    <div className={`min-h-screen ${bg} ${textPrimary} p-4`} style={{ fontFamily: 'system-ui, -apple-system, sans-serif' }}>
+      <div className="max-w-3xl mx-auto space-y-4">
+
+        {/* Header */}
+        <div className="text-center space-y-1">
+          <div className="flex items-center justify-center gap-3">
+            <h1 className="text-2xl font-bold text-amber-400">BTC Power Law Monitor</h1>
+            <button onClick={() => setTheme(isDark ? 'light' : 'dark')}
+              className={`px-2 py-1 rounded-lg text-xs ${isDark ? 'bg-slate-800 text-slate-400' : 'bg-gray-200 text-gray-600'}`}>
+              {isDark ? '☀' : '🌙'}
+            </button>
+          </div>
+          <p className={`${textSecondary} text-sm`}>Skaleninvariante Regression (w=1/t) + Log-Periodische Oszillation</p>
+        </div>
+
+        {/* Input Controls */}
+        <div className={`${cardBg} rounded-xl p-4 border ${cardBorder}`}>
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className={`text-xs ${textSecondary} uppercase tracking-wider flex items-center gap-2`}>
+                BTC Preis (USD)
+                {fetchStatus === 'ok' && <span className="text-green-400 text-xs">● Live</span>}
+                {fetchStatus === 'loading' && <span className="text-amber-400 text-xs">⟳</span>}
+                {fetchStatus === 'error' && <span className="text-red-400 text-xs">● Offline</span>}
+              </label>
+              <input type="number" value={btcPrice}
+                onChange={(e) => { setBtcPrice(Number(e.target.value)); setAutoRefresh(false); }}
+                className={`w-full mt-1 ${inputBg} rounded-lg px-3 py-2 text-lg font-mono focus:outline-none focus:border-amber-500 border`} />
+            </div>
+            <div>
+              <label className={`text-xs ${textSecondary} uppercase tracking-wider`}>Datum</label>
+              <input type="date" value={customDate}
+                onChange={(e) => { setCustomDate(e.target.value); setAutoRefresh(false); }}
+                className={`w-full mt-1 ${inputBg} rounded-lg px-3 py-2 text-lg focus:outline-none focus:border-amber-500 border`} />
+            </div>
+          </div>
+          <div className="mt-3 flex items-center gap-2 flex-wrap">
+            <button
+              onClick={() => setShowOscillation(!showOscillation)}
+              className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors ${showOscillation ? 'bg-purple-900/50 text-purple-300 border border-purple-700' : 'bg-slate-800 text-slate-500 border border-slate-700'}`}>
+              Log-Periodisch {showOscillation ? 'AN' : 'AUS'}
+            </button>
+            <button
+              onClick={() => { setAutoRefresh(!autoRefresh); if (!autoRefresh) fetchPrice(); }}
+              className={`px-3 py-1 rounded-lg text-xs font-medium transition-colors ${autoRefresh ? 'bg-green-900/50 text-green-300 border border-green-700' : 'bg-slate-800 text-slate-500 border border-slate-700'}`}>
+              Auto-Refresh {autoRefresh ? 'AN (60s)' : 'AUS'}
+            </button>
+            <button
+              onClick={fetchPrice}
+              className="px-3 py-1 rounded-lg text-xs font-medium bg-slate-800 text-slate-400 border border-slate-700 hover:border-amber-600 hover:text-amber-400 transition-colors">
+              Jetzt laden
+            </button>
+            {lastUpdate && (
+              <span className="text-xs text-slate-600">
+                Letztes Update: {lastUpdate.toLocaleTimeString('de-DE')}
+              </span>
+            )}
+          </div>
+          <div className="mt-2">
+            <span className="text-xs text-slate-600">R² = {OSCILLATION.rSquared} | λ ≈ {OSCILLATION.lambda} | ω = {OSCILLATION.omega} | δ = {OSCILLATION.ampDecay.toFixed(3)} | 5704 pts</span>
+          </div>
+        </div>
+
+        {/* Zone Indicator */}
+        <div className="bg-slate-900 rounded-xl p-4 border border-slate-800 space-y-3">
+          <div className="flex items-center justify-between">
+            <div>
+              <span className="text-xl font-bold" style={{ color: zone.color }}>{zone.label}</span>
+              <p className="text-slate-400 text-sm mt-1">
+                Preis / Fair Value: <span className="text-white font-mono">{(ratio * 100).toFixed(1)}%</span>
+                {showOscillation && (
+                  <span className="text-slate-600 ml-2">
+                    | vs. Osc.-Adjusted: <span className="text-purple-300 font-mono">{(oscRatio * 100).toFixed(1)}%</span>
+                  </span>
+                )}
+              </p>
+            </div>
+            <div className="text-right">
+              <p className="text-xs text-slate-500">AKTION</p>
+              <p className="text-sm font-medium" style={{ color: zone.color }}>{zone.action}</p>
+            </div>
+          </div>
+          <ValueGauge ratio={ratio} />
+          <div className="flex items-center gap-3 mt-2 pt-2" style={{ borderTop: '1px solid rgba(100,116,139,0.2)' }}>
+            <div className="text-center">
+              <div className="text-2xl font-bold font-mono" style={{ color: zone.color }}>
+                {ratio < 0.55 ? '3.0×' : ratio < 0.75 ? '2.0×' : ratio < 0.95 ? '1.5×' : ratio < 1.15 ? '1.0×' : ratio < 1.5 ? '0.5×' : ratio < 2.0 ? '0.25×' : '0×'}
+              </div>
+              <p className={`text-xs ${textMuted}`}>DCA-Multiplikator</p>
+            </div>
+            <div className={`flex-1 text-xs ${textMuted} grid grid-cols-3 gap-x-2 gap-y-0.5`}>
+              <span><span className="text-green-500">●</span> {'<'}55% → 3×</span>
+              <span><span className="text-green-400">●</span> 55-75% → 2×</span>
+              <span><span className="text-lime-300">●</span> 75-95% → 1.5×</span>
+              <span><span className="text-amber-400">●</span> 95-115% → 1×</span>
+              <span><span className="text-orange-400">●</span> 115-150% → 0.5×</span>
+              <span><span className="text-red-400">●</span> {'>'}150% → 0.25×</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Current Values */}
+        <div className="grid grid-cols-4 gap-2">
+          <div className="bg-slate-900 rounded-xl p-3 border border-slate-800 text-center">
+            <p className="text-xs text-green-400 uppercase tracking-wider">Floor</p>
+            <p className="text-base font-bold font-mono text-green-300">{fmt(floorValue)}</p>
+            <p className="text-xs text-slate-600">d=0, β=5.10</p>
+          </div>
+          <div className="bg-slate-900 rounded-xl p-3 border border-amber-800/50 text-center">
+            <p className="text-xs text-amber-400 uppercase tracking-wider">Median</p>
+            <p className="text-base font-bold font-mono text-amber-300">{fmt(fairValue)}</p>
+            <p className="text-xs text-slate-600">d=0.029</p>
+          </div>
+          {showOscillation && (
+            <div className="bg-slate-900 rounded-xl p-3 border border-purple-800/50 text-center">
+              <p className="text-xs text-purple-400 uppercase tracking-wider">Osc. Median</p>
+              <p className="text-base font-bold font-mono text-purple-300">{fmt(oscAdjustedFV)}</p>
+              <p className="text-xs text-slate-600">+Log-Period.</p>
+            </div>
+          )}
+          <div className="bg-slate-900 rounded-xl p-3 border border-slate-800 text-center">
+            <p className="text-xs text-red-400 uppercase tracking-wider">Ceiling</p>
+            <p className="text-base font-bold font-mono text-red-300">{fmt(ceilingValue)}</p>
+            <p className="text-xs text-slate-600">d=0.045</p>
+          </div>
+        </div>
+
+        {/* Projections (moved up for quick reference) */}
+        <div className={`${cardBg} rounded-xl p-4 border ${cardBorder}`}>
+          <h2 className={`text-sm font-semibold ${isDark ? 'text-slate-300' : 'text-gray-700'} mb-2`}>Fair-Value-Projektionen</h2>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className={`${textMuted} text-xs uppercase`}>
+                  <th className="text-left py-1 px-2">Horizont</th>
+                  <th className="text-right py-1 px-2">Floor</th>
+                  <th className="text-right py-1 px-2">Median</th>
+                  {showOscillation && <th className="text-right py-1 px-2">Osc.</th>}
+                  <th className="text-right py-1 px-2">Ceiling</th>
+                </tr>
+              </thead>
+              <tbody>
+                {projections.map((p, i) => (
+                  <tr key={i} className={i % 2 === 0 ? (isDark ? 'bg-slate-800/30' : 'bg-gray-50') : ''}>
+                    <td className={`py-1 px-2 ${isDark ? 'text-slate-300' : 'text-gray-700'}`}>{p.label}</td>
+                    <td className="py-1 px-2 text-right font-mono text-green-400 text-xs">{fmt(p.floor)}</td>
+                    <td className="py-1 px-2 text-right font-mono text-amber-400 font-semibold text-xs">{fmt(p.median)}</td>
+                    {showOscillation && <td className="py-1 px-2 text-right font-mono text-purple-400 text-xs">{fmt(p.oscMedian)}</td>}
+                    <td className="py-1 px-2 text-right font-mono text-red-400 text-xs">{fmt(p.ceiling)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* Cycle Phase (Log-Periodic) - collapsible */}
+        {showOscillation && (
+          <Section title="Zyklusposition (Diskrete Skaleninvarianz)" borderColor="border-purple-900/30" theme={theme}>
+            <CyclePhaseIndicator tNow={tNow} btcPrice={btcPrice} fairValue={fairValue} />
+            <OscillationChart currentDate={currentDate} />
+            <p className={`text-xs ${textMuted} text-center`}>
+              Punkte = historische Residuen (ln(Preis/Median)) | Linie = log-periodisches Modell (ω, 2ω, 3ω, 4ω)
+            </p>
+          </Section>
+        )}
+
+        {/* Cycle Timing Analysis */}
+        {showOscillation && (() => {
+          // Find next peak from oscillation
+          const scanPts = 5000;
+          let peakYear = null, peakOsc = 0;
+          const currYr = currentDate.getFullYear() + currentDate.getMonth() / 12;
+          for (let i = 1; i < scanPts - 1; i++) {
+            const y = currYr + i * 0.005;
+            const dt = new Date(new Date(2013, 0, 1).getTime() + (y - 2013) * 365.25 * MS_PER_DAY);
+            const t = daysSinceGenesis(dt);
+            if (t < 100) continue;
+            const o = oscillationValue(t);
+            const oPrev = oscillationValue(t - 10);
+            const oNext = oscillationValue(t + 10);
+            if (o > oPrev && o > oNext && o > 0.05 && !peakYear) {
+              peakYear = y; peakOsc = o;
+            }
+          }
+          if (!peakYear) return null;
+
+          const peakMo = Math.floor((peakYear % 1) * 12) + 1;
+          const peakYr = Math.floor(peakYear);
+          const windowLo = new Date(peakYr, peakMo - 4, 1);
+          const windowHi = new Date(peakYr, peakMo + 2, 1);
+          const tPeak = daysSinceGenesis(new Date(peakYr, peakMo - 1, 1));
+          const impliedPrice = powerLawPrice(tPeak, MODELS.median) * Math.exp(peakOsc);
+          const monthsAway = Math.round((peakYear - currYr) * 12);
+
+          // Macro conditions — derived from 4 historical BTC peaks
+          const latestPmi = getLatestPmi()[1];
+          const pmiTrend3m = PMI_HISTORY.length >= 3 ? PMI_HISTORY[PMI_HISTORY.length-1][1] - PMI_HISTORY[PMI_HISTORY.length-3][1] : 0;
+          // 12-month PMI max
+          const pmi12m = PMI_HISTORY.slice(-12).map(d => d[1]);
+          const pmiMax12m = pmi12m.length > 0 ? Math.max(...pmi12m) : latestPmi;
+          // PMI declining from high? (high = was >57 in last 12M, now lower)
+          const pmiRollover = pmiMax12m >= 57 && latestPmi < pmiMax12m - 1;
+          const goldBtcRatio = goldPrice / btcPrice;
+
+          // Historical peak PMI values: 55.3, 57.0, 59.3, 61.1 (min 55, mean 58)
+          // Historical peak PMI 12M-max: 57.0, 61.2, 60.8, 64.7 (min 57, mean 61)
+          // At 3/4 peaks: PMI was declining from a recent high (rollover)
+          const conditions = [
+            {
+              label: "Zyklusmodell",
+              desc: `Peak-Fenster ${windowLo.getMonth()+1}/${windowLo.getFullYear()} – ${windowHi.getMonth()+1}/${windowHi.getFullYear()}`,
+              met: monthsAway < 30,
+              color: "#c084fc",
+              detail: `Noch ~${monthsAway} Monate (±3M MAE)`,
+            },
+            {
+              label: "PMI ≥ 55",
+              desc: "Peak-Zone (alle hist. Peaks: 55–61)",
+              met: latestPmi >= 55,
+              color: "#06b6d4",
+              detail: `Aktuell: ${latestPmi.toFixed(1)} (${latestPmi >= 55 ? '✓ Peak-Zone' : latestPmi >= 50 ? 'Expansion, noch unter Schwelle' : 'Kontraktion'})`,
+            },
+            {
+              label: "PMI 12M-Hoch ≥ 57",
+              desc: "Wirtschaft hat Expansionsphase durchlaufen",
+              met: pmiMax12m >= 57,
+              color: "#06b6d4",
+              detail: `12M-Hoch: ${pmiMax12m.toFixed(1)} (Schwelle: 57, hist. min vor Peaks)`,
+            },
+            {
+              label: "PMI Rollover",
+              desc: "Hoch aber abflachend (3/4 hist. Peaks)",
+              met: pmiRollover,
+              color: "#06b6d4",
+              detail: pmiMax12m >= 57 ? `12M-Hoch ${pmiMax12m.toFixed(1)} → aktuell ${latestPmi.toFixed(1)} (${pmiRollover ? 'Rollover ✓' : 'noch nicht'})` : `12M-Hoch ${pmiMax12m.toFixed(1)} — erst ab 57 relevant`,
+            },
+            {
+              label: "Gold/BTC fallend",
+              desc: "Rotation aus Safe Haven in Risk",
+              met: ratioHistory.length > 10 && ratioHistory[ratioHistory.length-1]?.ratio < ratioHistory[Math.max(0, ratioHistory.length-15)]?.ratio,
+              color: "#fbbf24",
+              detail: goldPrice > 0 ? `Gold/BTC: ${goldBtcRatio.toFixed(4)}` : 'Keine Daten',
+            },
+            {
+              label: "Preis > Median",
+              desc: "BTC über Power-Law Fair Value",
+              met: btcPrice > fairValue,
+              color: "#f59e0b",
+              detail: `${(btcPrice/fairValue*100).toFixed(0)}% des Median (${fmt(fairValue)})`,
+            },
+          ];
+
+          const metCount = conditions.filter(c => c.met).length;
+          const readiness = metCount / conditions.length;
+          const readinessColor = readiness >= 0.8 ? '#ef4444' : readiness >= 0.6 ? '#f97316' : readiness >= 0.4 ? '#fbbf24' : '#22c55e';
+          const readinessLabel = readiness >= 0.8 ? 'Peak nahe' : readiness >= 0.6 ? 'Aufbauphase' : readiness >= 0.4 ? 'Früher Zyklus' : 'Akkumulationsphase';
+
+          return (
+            <Section title={`Zyklus-Timing — ${metCount}/${conditions.length} Bedingungen · ${readinessLabel}`} borderColor="border-purple-900/30" theme={theme}>
+
+              {/* Peak window summary */}
+              <div className="bg-slate-800/60 rounded-lg p-3 flex items-center justify-between">
+                <div>
+                  <p className="text-xs text-slate-500 uppercase tracking-wider">Nächstes Peak-Fenster</p>
+                  <p className="text-lg font-bold text-green-400">
+                    {windowLo.getMonth()+1}/{windowLo.getFullYear()} – {windowHi.getMonth()+1}/{windowHi.getFullYear()}
+                  </p>
+                  <p className="text-xs text-slate-500">Mittelpunkt: {peakMo}/{peakYr} · Noch ~{monthsAway} Monate · MAE ±3M (4 hist. Zyklen)</p>
+                </div>
+                <div className="text-right">
+                  <p className="text-xs text-slate-500">Implied Peak-Preis</p>
+                  <p className="text-lg font-bold font-mono text-green-300">{fmt(impliedPrice)}</p>
+                  <p className="text-xs text-slate-600">(Osc-adj. Median)</p>
+                </div>
+              </div>
+
+              {/* Macro confirmation checklist */}
+              <div className="space-y-1.5">
+                {conditions.map((c, i) => (
+                  <div key={i} className={`flex items-center justify-between px-3 py-2 rounded-lg text-sm ${c.met ? 'bg-slate-800/80' : 'bg-slate-800/30'}`}>
+                    <div className="flex items-center gap-2">
+                      <div className={`w-3 h-3 rounded-full flex items-center justify-center text-xs ${c.met ? '' : 'border border-slate-600'}`}
+                        style={c.met ? { backgroundColor: c.color } : {}}>
+                        {c.met && <span className="text-white text-xs">✓</span>}
+                      </div>
+                      <div>
+                        <span className={c.met ? 'text-slate-200' : 'text-slate-500'}>{c.label}</span>
+                        <span className="text-slate-600 text-xs ml-2">{c.desc}</span>
+                      </div>
+                    </div>
+                    <span className="text-xs text-slate-500 font-mono">{c.detail}</span>
+                  </div>
+                ))}
+              </div>
+
+              <div className="text-xs text-slate-600 px-1">
+                <p>
+                  Das Peak-Fenster kommt aus dem log-periodischen Modell (λ≈2, ω=8.894). MAE ±3 Monate (4 hist. Zyklen, Perrenod 2026).
+                  PMI-Schwellen empirisch abgeleitet: An allen 4 historischen BTC-Peaks lag der ISM PMI bei 55–61 (Ø 58),
+                  und in den 12 Monaten zuvor wurde mindestens 57 erreicht. Bei 3 von 4 Peaks war PMI bereits vom Hoch
+                  abflachend — der typische Peak fällt in die Phase "hoch aber rollover". PMI = 50 allein ist keine Peak-Bedingung.
+                </p>
+              </div>
+            </Section>
+          );
+        })()}
+
+        {/* Power Law Chart */}
+        <Section title="Power Law Bänder (log-Skala)" theme={theme}>
+          <PowerLawChart currentPrice={btcPrice} currentDate={currentDate} showOscillation={showOscillation} />
+        </Section>
+
+        {/* Business Cycle / PMI Module */}
+        <Section title="Business Cycle — ISM PMI" borderColor="border-cyan-900/30" theme={theme}>
+          <div className="flex items-center gap-3 text-xs mb-2">
+            {(() => {
+              const [, pmi] = getLatestPmi();
+              const color = pmi >= 50 ? '#22c55e' : '#ef4444';
+              const label = pmi >= 50 ? 'Expansion' : 'Kontraktion';
+              return (
+                <>
+                  <span className={textSecondary}>PMI: <span className="font-mono font-bold" style={{ color }}>{pmi.toFixed(1)}</span></span>
+                  <span style={{ color }} className="font-medium">{label}</span>
+                  <span className={textSecondary}>PMI-adj. FV: <span className="text-cyan-400 font-mono">${fmt(getPmiAdjustedFairValue(pmi, fairValue))}</span></span>
+                </>
+              );
+            })()}
+          </div>
+          <PmiOverlayChart btcPrice={btcPrice} currentDate={currentDate} />
+          <PmiAdjustedFVChart btcPrice={btcPrice} currentDate={currentDate} />
+          <div className={`text-xs ${textMuted} space-y-1`}>
+            <p><span className="text-cyan-400 font-semibold">Chart 1:</span> BTC vs. PMI. Grün = PMI {'>'} 50 (Expansion), Rot = PMI {'<'} 50.</p>
+            <p><span className="text-cyan-400 font-semibold">Chart 2:</span> PMI-adjustierter FV. R²=0.51: Jeder PMI-Punkt ≈ 3.7% auf FV.</p>
+          </div>
+        </Section>
+
+        {/* Gold/BTC Ratio */}
+        <Section title="Gold / BTC Ratio (90 Tage)" borderColor="border-amber-900/30" theme={theme}>
+          <div className="flex items-center gap-3 text-xs mb-2">
+            <span className={textSecondary}>Gold: <span className="text-amber-400 font-mono">${goldPrice.toLocaleString()}</span></span>
+            <span className={textSecondary}>BTC: <span className={`${textPrimary} font-mono`}>${btcPrice.toLocaleString()}</span></span>
+            <span className={textSecondary}>1 oz = <span className="text-amber-300 font-mono">{(goldPrice / btcPrice).toFixed(4)}</span> BTC</span>
+          </div>
+          <GoldBtcRatioChart
+            ratioHistory={ratioHistory}
+            currentRatio={goldPrice / btcPrice}
+            goldPrice={goldPrice}
+            btcPrice={btcPrice}
+          />
+          <div className={`text-xs ${textMuted} space-y-1`}>
+            <p><span className="text-amber-400 font-semibold">Lesehilfe:</span> Fallende Ratio = BTC gewinnt vs. Gold (Bullphase). Steigende Ratio = Gold schlägt BTC (Korrektur/Safe Haven).</p>
+            <p><span className="text-amber-400 font-semibold">Kontext:</span> Gold-Bullruns gehen BTC-Bullruns voraus. Trendwende der Ratio nach unten bestätigt BTC-Aufholjagd.</p>
+          </div>
+        </Section>
+
+        {/* Gold → BTC Rotation Signal */}
+        <Section title="Makro-Regime: Gold → BTC Rotation" borderColor="border-emerald-900/30" theme={theme}>
+          <RotationSignalChart ratioHistory={ratioHistory} goldPrice={goldPrice} btcPrice={btcPrice} />
+          <div className={`text-xs ${textMuted} space-y-1`}>
+            <p>
+              <span className="font-semibold" style={{ color: '#f97316' }}>■ Risk-On:</span> BTC steigt stärker als Gold.
+              {' '}<span className="font-semibold" style={{ color: '#22c55e' }}>■ Rotation → BTC:</span> Gold fällt, BTC hält — das wertvollste Signal.
+            </p>
+            <p>
+              <span className="font-semibold" style={{ color: '#ef4444' }}>■ Risk-Off:</span> BTC fällt stärker als Gold.
+              {' '}<span className="font-semibold" style={{ color: '#eab308' }}>■ Safe Haven:</span> Gold steigt stärker — Flucht in Sicherheit.
+            </p>
+          </div>
+        </Section>
+
+        {/* Take Profit Levels */}
+        <Section title="Take-Profit Trigger" theme={theme}>
+          <div className="space-y-1.5">
+            {takeProfits.map((tp, i) => {
+              const isActive = btcPrice >= tp.price;
+              const isNext = i > 0 && btcPrice < tp.price && btcPrice >= takeProfits[i - 1].price;
+              return (
+                <div key={i} className={`flex items-center justify-between px-3 py-2 rounded-lg text-sm ${isActive ? 'bg-red-900/30 border border-red-800/50' : isNext ? 'bg-amber-900/20 border border-amber-800/30' : (isDark ? 'bg-slate-800/50' : 'bg-gray-50')}`}>
+                  <div className="flex items-center gap-2">
+                    <div className={`w-2 h-2 rounded-full ${isActive ? 'bg-red-400' : (isDark ? 'bg-slate-600' : 'bg-gray-300')}`} />
+                    <span className={isActive ? 'text-red-300' : textSecondary}>{tp.level}</span>
+                  </div>
+                  <div className="flex items-center gap-4">
+                    <span className={`font-mono ${isDark ? 'text-slate-300' : 'text-gray-700'}`}>{fmt(tp.price)}</span>
+                    <span className={`text-xs ${textMuted} w-12 text-right`}>{tp.pct}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </Section>
+
+        {/* Model Documentation */}
+        <div className={`${isDark ? 'bg-slate-800/50' : 'bg-gray-100'} rounded-xl p-4 text-xs ${textMuted} space-y-2`}>
+          <p className={`font-semibold ${textSecondary}`}>Drei-Schichten-Modell + Makro-Overlay</p>
+          <p className={`${textSecondary} italic`}>
+            ln(P) = [a + (β − d·ln(t))·ln(t)] + Σ Cₙ · t^(-δ) · cos(nω·ln(t) + φₙ) + f(PMI)
+          </p>
+          <p>
+            <span className="text-amber-500 font-semibold">Schicht 1 — Trend (Decay Power Law):</span>{' '}
+            Skaleninvariante Quantil-Regression (τ=0.50) mit Jacobian w(t)=1/t.
+            8 unabhängige Decay-Funktionen konvergieren auf d≈0.029 am Median.
+            Kalibriert: $101k Median, $56k Floor, $160k Ceiling.
+          </p>
+          <p>
+            <span className="text-purple-500 font-semibold">Schicht 2 — Oszillation (Amplituden-Decay):</span>{' '}
+            osc(t) = Σ Cₙ·t^(-0.684)·cos(nω·ln(t)+φₙ). ω=8.894 (λ≈2.03).
+            Fit: 5.704 tägliche Datenpunkte. R²=0.605.
+            ±1σ Prediction Band (σ=0.56 ln-Raum). C = K·ln(Λ) ≈ 3.96 (Coupling Constant).
+          </p>
+          <p>
+            <span className="text-cyan-500 font-semibold">Schicht 3 — Makro (ISM PMI):</span>{' '}
+            Regression BTC-Residual auf PMI: R²=0.51 (2018–25). Jeder PMI-Punkt ≈ 3.7% auf FV.
+            Peak-Bedingung: PMI ≥ 55 (alle 4 hist. Peaks). Gold/BTC-Rotation als Regime-Indikator.
+          </p>
+          <p className={textMuted}>
+            <span className="font-semibold">R²-Hinweis:</span>{' '}
+            Alle R² beziehen sich auf ln(Price), nicht Market Cap. R² zwischen verschiedenen
+            Baselines nicht vergleichbar (Nau/Duke). Einfaches PL als Vergleichskurve einblendbar.
+          </p>
+          <p className="text-amber-600 mt-2 font-semibold">
+            Kein Finanzprodukt. Modellbasierte Orientierung, keine Anlageberatung.
+            Eigene Verifikation erforderlich.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
