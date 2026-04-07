@@ -1056,8 +1056,8 @@ function BTCPowerLawMonitor() {
             <tbody>{projections.map(function(p,i){return <tr key={i} className={i%2===0?(isDark?'bg-slate-800/30':'bg-gray-50'):''}><td className="py-1 px-2">{p.label}</td><td className="py-1 px-2 text-right font-mono text-green-400 text-xs">{fmt(p.floor)}</td><td className="py-1 px-2 text-right font-mono text-amber-400 text-xs font-semibold">{fmt(p.median)}</td><td className="py-1 px-2 text-right font-mono text-red-400 text-xs">{fmt(p.ceiling)}</td></tr>;})}</tbody></table>
           </div>
 
-          {showOscillation && <Section id="sec-cycle" title="Cycle Position" borderColor="border-purple-900/30">
-            <OscillationChart currentDate={currentDate} />
+          {showOscillation && <Section id="sec-cycle" title="Cycle Position" borderColor="border-purple-900/30" defaultOpen={true}>
+            <ZoomWrap><OscillationChart currentDate={currentDate} /></ZoomWrap>
             <p className={"text-xs text-center "+txt3}>Dots = historical residuals | Line = log-periodic model</p>
           </Section>}
 
