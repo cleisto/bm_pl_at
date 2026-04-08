@@ -1,9 +1,10 @@
 #!/bin/bash
-# Regenerates android-app/assets/index.html from btc_power_law_monitor.jsx.txt
+# Regenerates index.html for both android-app/ and btc-monitor-apk/ from JSX source
 set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-JSX_SRC="$ROOT/btc_power_law_monitor.jsx.txt"
-HTML_OUT="$ROOT/android-app/assets/index.html"
+JSX_SRC="$ROOT/btc_power_law_monitor_v6.1.jsx"
+HTML_OUT_APP="$ROOT/android-app/assets/index.html"
+HTML_OUT_APK="$ROOT/btc-monitor-apk/app/src/main/assets/index.html"
 
 {
 cat << 'HEADER'
@@ -27,7 +28,7 @@ cat << 'HEADER'
 <body>
   <div id="root"></div>
   <script type="text/babel">
-    const { useState, useMemo, useEffect, useCallback } = React;
+    const { useState, useMemo, useEffect, useCallback, useRef } = React;
 
 HEADER
 
@@ -43,6 +44,9 @@ cat << 'FOOTER'
 </body>
 </html>
 FOOTER
-} > "$HTML_OUT"
+} > "$HTML_OUT_APP"
 
-echo "Generated: $HTML_OUT ($(wc -l < "$HTML_OUT") lines)"
+cp "$HTML_OUT_APP" "$HTML_OUT_APK"
+
+echo "Generated: $HTML_OUT_APP ($(wc -l < "$HTML_OUT_APP") lines)"
+echo "Copied to: $HTML_OUT_APK"

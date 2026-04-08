@@ -1,2 +1,5 @@
 build/
 btc-monitor-apk/.gradle/
+btc-monitor-apk/local.properties
+*.apk
+*.b64
