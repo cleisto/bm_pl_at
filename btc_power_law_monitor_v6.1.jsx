@@ -819,6 +819,9 @@ export default function BTCPowerLawMonitor() {
   var _rh = useState([]); var ratioHistory = _rh[0]; var setRatioHistory = _rh[1];
   var _pg = useState('dashboard'); var page = _pg[0]; var setPage = _pg[1];
   var _nv = useState(false); var navOpen = _nv[0]; var setNavOpen = _nv[1];
+  var _disc = useState(function() { try { return localStorage.getItem('btcm_disclaimer') === 'accepted'; } catch(e) { return false; } });
+  var disclaimerAccepted = _disc[0]; var setDisclaimerAccepted = _disc[1];
+  function acceptDisclaimer() { try { localStorage.setItem('btcm_disclaimer', 'accepted'); } catch(e) {} setDisclaimerAccepted(true); }
 
   var fetchPrice = useCallback(function() {
     setFetchStatus('loading');
@@ -951,6 +954,23 @@ export default function BTCPowerLawMonitor() {
   var txt2 = 'text-slate-400';
   var txt3 = 'text-slate-600';
   var inputCls = 'bg-slate-800 border-slate-700 text-white';
+
+  if (!disclaimerAccepted) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-950 p-6" style={{fontFamily:'system-ui, -apple-system, sans-serif'}}>
+        <div className="bg-slate-900 rounded-2xl border border-slate-700 p-6 max-w-md w-full space-y-4">
+          <h1 className="text-xl font-bold text-amber-400 text-center">BTC Power Law Monitor</h1>
+          <div className="bg-amber-900/30 border border-amber-700/50 rounded-lg p-4 text-sm text-amber-200 space-y-2">
+            <p className="font-bold">Important Disclaimer</p>
+            <p>This app provides mathematical model-based projections and is <strong>not financial advice</strong>.</p>
+            <p>All information is for <strong>educational and informational purposes only</strong>. The developers are not licensed financial advisors.</p>
+            <p>Investment decisions are <strong>your sole responsibility</strong>. Past performance does not guarantee future results. Cryptocurrency investments carry significant risk, including the possible loss of all invested capital.</p>
+          </div>
+          <button onClick={acceptDisclaimer} className="w-full py-3 rounded-xl bg-amber-500 text-slate-900 font-bold text-sm hover:bg-amber-400 transition-colors">I Understand — Continue</button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className={"min-h-screen p-4 " + bg + " text-white"} style={{fontFamily:'system-ui, -apple-system, sans-serif'}}>
@@ -1128,7 +1148,7 @@ export default function BTCPowerLawMonitor() {
             <p><span className="text-amber-500 font-semibold">Layer 1 - Trend:</span> Decay Power Law d=0.029. $101k median, $56k floor, $160k ceiling.</p>
             <p><span className="text-purple-500 font-semibold">Layer 2 - Oscillation:</span> Log-periodic with amp decay. w=8.894, lambda=2.03, delta=0.684. R2=0.605. +/-1sigma band.</p>
             <p><span className="text-cyan-500 font-semibold">Layer 3 - Macro:</span> ISM PMI regression R2=0.51. Peak condition: PMI &gt;= 55. C = K*ln(lambda) = 3.96.</p>
-            <p className="text-amber-600 mt-2 font-semibold">Not a financial product. Model-based orientation, not investment advice.</p>
+            <p className="text-amber-600 mt-2 font-semibold">Not financial advice. Model-based projections for educational purposes only. Investment decisions are your sole responsibility.</p>
           </div>
 
         </div>}

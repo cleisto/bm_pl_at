@@ -1,5 +1,9 @@
 build/
 btc-monitor-apk/.gradle/
 btc-monitor-apk/local.properties
+btc-monitor-apk/keystore.properties
+btc-monitor-apk/*.keystore
+btc-monitor-apk/*.jks
 *.apk
+*.aab
 *.b64
